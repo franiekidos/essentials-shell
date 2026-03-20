@@ -1,0 +1,38 @@
+{
+    "current": "rose-pine",
+    "catppuccin": {
+        "bg": "rgba(30, 30, 46, 0.92)",
+        "accent": "#cba6f7",
+        "text": "#cdd6f4",
+        "radius": "12px",
+        "font": "JetBrainsMono Nerd Font"
+    },
+    "gruvbox": {
+        "bg": "rgba(40, 40, 40, 0.92)",
+        "accent": "#fabd2f",
+        "text": "#ebdbb2",
+        "radius": "8px",
+        "font": "JetBrainsMono Nerd Font"
+    },
+    "nord": {
+        "bg": "rgba(36, 41, 51, 0.92)",
+        "accent": "#88c0d0",
+        "text": "#eceff4",
+        "radius": "10px",
+        "font": "JetBrainsMono Nerd Font"
+    },
+    "dracula": {
+        "bg": "rgba(40, 42, 54, 0.92)",
+        "accent": "#bd93f9",
+        "text": "#f8f8f2",
+        "radius": "12px",
+        "font": "JetBrainsMono Nerd Font"
+    },
+    "rose-pine": {
+        "bg": "rgba(25, 23, 36, 0.92)",
+        "accent": "#c4a7e7",
+        "text": "#e0def4",
+        "radius": "14px",
+        "font": "JetBrainsMono Nerd Font"
+    }
+}

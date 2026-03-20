@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+essentials-detect  —  Compositor detection & abstraction layer.
+
+Run as script  →  prints WM name (or --json for full info)
+Import via importlib from bars/settings/CC:
+
+    import importlib.util, os
+    _s = importlib.util.spec_from_file_location(
+             "essentials_detect",
+             os.path.expanduser("~/.local/bin/essentials-detect"))
+    _m = importlib.util.module_from_spec(_s); _s.loader.exec_module(_m)
+    WM = _m.detect()
+"""
+import os, json, subprocess, shutil, re
+
+def _run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd), text=True, stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+def _rjson(*cmd, fallback=None):
+    try:    return json.loads(_run(*cmd))
+    except: return fallback
+
+def _has(cmd): return shutil.which(cmd) is not None
+
+def _detect_name():
+    env = {k.lower(): v for k, v in os.environ.items()}
+    if "hyprland_instance_signature" in env: return "hyprland"
+    if "niri_socket"                  in env: return "niri"
+    if "swaysock"                     in env: return "sway"
+    p = _run("ps", "-A", "-o", "comm=").lower()
+    for name in ("river", "labwc", "mangowc", "wayfire", "hikari"):
+        if name in p: return name
+    return env.get("xdg_current_desktop", "generic").lower()
+
+
+class Compositor:
+    _BIND = {
+        "hyprland": ("bind = {mod}, {key}, {cmd}",
+                     r"^bind\s*=\s*(.+?),\s*(.+?),\s*(.+)"),
+        "sway":     ("bindsym {mod}+{key} {cmd}",
+                     r"^bindsym\s+(\S+)\+(\S+)\s+(.+)"),
+        "river":    ("riverctl map normal {mod} {key} {cmd}",
+                     r"^riverctl map normal\s+(\S+)\s+(\S+)\s+(.+)"),
+    }
+
+    def __init__(self, name): self.name = name
+    def __repr__(self):       return f"Compositor({self.name!r})"
+
+    # ── Workspaces ────────────────────────────────────────────────────────────
+    def get_active_workspace(self):
+        try:
+            if self.name == "hyprland":
+                return int(_rjson("hyprctl","activeworkspace","-j",fallback={}).get("id",1))
+            if self.name == "niri":
+                wss = _rjson("niri","msg","-j","workspaces",fallback=[])
+                return next((i+1 for i,w in enumerate(wss) if w.get("is_focused")), 1)
+            if self.name == "sway":
+                wss = _rjson("swaymsg","-t","get_workspaces",fallback=[])
+                return next((int(w.get("num",1)) for w in wss if w.get("focused")), 1)
+        except: pass
+        return 1
+
+    def get_workspace_count(self):
+        try:
+            if self.name == "hyprland":
+                return max(4, len(_rjson("hyprctl","workspaces","-j",fallback=[])))
+            if self.name == "niri":
+                return max(4, len(_rjson("niri","msg","-j","workspaces",fallback=[])))
+            if self.name == "sway":
+                return max(4, len(_rjson("swaymsg","-t","get_workspaces",fallback=[])))
+        except: pass
+        return 4
+
+    # ── Monitors ──────────────────────────────────────────────────────────────
+    def get_monitors(self):
+        try:
+            if self.name == "hyprland":
+                return [dict(name=m.get("name",""),
+                    width=m.get("width",0), height=m.get("height",0),
+                    refresh=m.get("refreshRate",0), x=m.get("x",0), y=m.get("y",0),
+                    modes=[{"res": md.split("@")[0],
+                            "refresh": md.split("@")[1] if "@" in md else ""}
+                           for md in m.get("availableModes",[])])
+                    for m in _rjson("hyprctl","monitors","all","-j",fallback=[])]
+
+            if self.name == "niri":
+                raw = _rjson("niri","msg","-j","outputs",fallback={})
+                mons = []
+                for name, m in (raw.items() if isinstance(raw,dict) else []):
+                    c = m.get("current_mode") or {}
+                    mons.append(dict(name=name,
+                        width=c.get("width",0), height=c.get("height",0),
+                        refresh=c.get("refresh_rate",0), x=0, y=0,
+                        modes=[{"res":f"{md.get('width')}x{md.get('height')}",
+                                "refresh":str(md.get("refresh_rate",""))}
+                               for md in m.get("modes",[])]))
+                return mons
+
+            if self.name == "sway":
+                return [dict(name=m.get("name",""),
+                    width=m.get("rect",{}).get("width",0),
+                    height=m.get("rect",{}).get("height",0),
+                    refresh=m.get("refresh_rate",0),
+                    x=m.get("rect",{}).get("x",0),
+                    y=m.get("rect",{}).get("y",0),
+                    modes=[{"res":f"{md.get('width')}x{md.get('height')}",
+                            "refresh":str(md.get("refresh",""))}
+                           for md in m.get("modes",[])])
+                    for m in _rjson("swaymsg","-t","get_outputs",fallback=[])]
+
+            if _has("wlr-randr"):
+                return self._wlrandr()
+        except: pass
+        return []
+
+    def _wlrandr(self):
+        mons, cur = [], None
+        for line in _run("wlr-randr").splitlines():
+            if line and not line[0].isspace():
+                if cur: mons.append(cur)
+                cur = dict(name=line.split()[0], width=0, height=0,
+                           refresh=0, x=0, y=0, modes=[])
+            elif cur and "x" in line and "@" in line:
+                try:
+                    res, rr = line.strip().split()[:2]
+                    cur["modes"].append({"res":res,"refresh":rr.replace("Hz","")})
+                    if "(current)" in line:
+                        w,h = map(int, res.split("x"))
+                        cur["width"]=w; cur["height"]=h
+                        cur["refresh"]=float(rr.replace("Hz",""))
+                except: pass
+        if cur: mons.append(cur)
+        return mons
+
+    def set_monitor(self, name, resolution, transform=0, scale=1.0):
+        try:
+            if self.name == "hyprland":
+                return subprocess.run(
+                    ["hyprctl","keyword","monitor",
+                     f"{name},{resolution},auto,{scale},transform,{transform}"],
+                    stderr=subprocess.DEVNULL).returncode == 0
+            if self.name == "sway":
+                w,h = resolution.split("@")[0].split("x")
+                rr  = resolution.split("@")[1] if "@" in resolution else None
+                args = ["swaymsg","output",name,"resolution",f"{w}x{h}"]
+                if rr: args += ["refresh", rr]
+                return subprocess.run(args, stderr=subprocess.DEVNULL).returncode == 0
+            if _has("wlr-randr"):
+                res = resolution.split("@")[0]
+                rr  = resolution.split("@")[1] if "@" in resolution else None
+                args = ["wlr-randr","--output",name,"--mode",res]
+                if rr: args += ["--refresh",rr]
+                return subprocess.run(args, stderr=subprocess.DEVNULL).returncode == 0
+        except: pass
+        return False
+
+    # ── Input ─────────────────────────────────────────────────────────────────
+    def get_input_devices(self):
+        try:
+            if self.name == "hyprland":
+                raw = _rjson("hyprctl","-j","devices",fallback={})
+                devs = []
+                for cat in ("mice","keyboards","tablets","touch"):
+                    for d in raw.get(cat,[]):
+                        devs.append(dict(name=d.get("name",""),
+                            identifier=d.get("address",""),
+                            type=cat.rstrip("s"),
+                            natural_scroll=None, accel=None, tap=None))
+                return devs
+            if self.name == "sway":
+                return [dict(name=d.get("name",""),
+                    identifier=d.get("identifier",""),
+                    type=d.get("type",""),
+                    natural_scroll=d.get("libinput",{}).get("natural_scroll","disabled")=="enabled",
+                    accel=d.get("libinput",{}).get("accel_speed",0.0),
+                    tap=d.get("libinput",{}).get("tap","disabled")=="enabled")
+                    for d in _rjson("swaymsg","-t","get_inputs",fallback=[])]
+        except: pass
+        return []
+
+    def set_input(self, identifier, prop, value):
+        try:
+            if self.name == "hyprland":
+                kw = {"natural_scroll":"natural_scroll","accel":"accel_profile",
+                      "pointer_speed":"sensitivity","tap":"tap_button_map",
+                      "left_handed":"left_handed"}.get(prop, prop)
+                val = "1" if value is True else "0" if value is False else str(value)
+                return subprocess.run(
+                    ["hyprctl","keyword",f"device[{identifier}].{kw}",val],
+                    stderr=subprocess.DEVNULL).returncode == 0
+            if self.name == "sway":
+                fmts = {"natural_scroll":("natural_scroll", lambda v:"enabled" if v else "disabled"),
+                        "accel":         ("accel_speed",    str),
+                        "pointer_speed": ("accel_speed",    str),
+                        "tap":           ("tap",            lambda v:"enabled" if v else "disabled"),
+                        "left_handed":   ("left_handed",    lambda v:"enabled" if v else "disabled")}
+                sw, fmt = fmts.get(prop, (prop, str))
+                return subprocess.run(
+                    ["swaymsg","input",identifier,sw,fmt(value)],
+                    stderr=subprocess.DEVNULL).returncode == 0
+        except: pass
+        return False
+
+    # ── Keybinds ──────────────────────────────────────────────────────────────
+    def get_config_path(self):
+        for path in {
+            "hyprland": ["~/.config/hypr/hyprland.conf"],
+            "niri":     ["~/.config/niri/config.kdl"],
+            "sway":     ["~/.config/sway/config","~/.config/i3/config"],
+            "river":    ["~/.config/river/init"],
+            "labwc":    ["~/.config/labwc/rc.xml"],
+            "mangowc":  ["~/.config/mangowc/config"],
+        }.get(self.name, []):
+            p = os.path.expanduser(path)
+            if os.path.exists(p): return p
+        return None
+
+    def parse_keybinds(self, lines):
+        pattern = self._BIND.get(self.name,(None,None))[1]
+        if not pattern: return []
+        result = []
+        for line in lines:
+            m = re.match(pattern, line.strip())
+            if m: result.append((m.group(1).strip(),
+                                  m.group(2).strip(),
+                                  m.group(3).strip()))
+        return result
+
+    def format_keybind(self, mod, key, cmd):
+        tmpl = self._BIND.get(self.name,("# {mod}+{key} → {cmd}",None))[0]
+        return tmpl.format(mod=mod, key=key, cmd=cmd)
+
+    def reload_config(self):
+        cmds = {"hyprland":["hyprctl","reload"], "sway":["swaymsg","reload"],
+                "river":[os.path.expanduser("~/.config/river/init")],
+                "labwc":["labwc","--reconfigure"]}
+        cmd = cmds.get(self.name)
+        if not cmd: return False
+        return subprocess.run(cmd, stderr=subprocess.DEVNULL).returncode == 0
+
+    # ── Plugins ───────────────────────────────────────────────────────────────
+    def supports_plugins(self):
+        return self.name == "hyprland" and _has("hyprpm")
+
+    def get_plugins(self):
+        if not self.supports_plugins(): return []
+        plugins, cur = [], {}
+        for line in _run("hyprpm","list").splitlines():
+            line = line.strip()
+            if line.startswith("Plugin"):
+                if cur: plugins.append(cur)
+                cur = {"name":line.split(None,1)[-1],"enabled":False,"version":""}
+            elif "enabled" in line.lower():
+                cur["enabled"] = "true" in line.lower() or "yes" in line.lower()
+            elif "version" in line.lower():
+                cur["version"] = line.split(":",1)[-1].strip()
+        if cur: plugins.append(cur)
+        return plugins
+
+    def plugin_action(self, name, action):
+        if not self.supports_plugins(): return False
+        return subprocess.run(["hyprpm",action,name],
+                               stderr=subprocess.DEVNULL).returncode == 0
+
+    def add_plugin_repo(self, url):
+        if not self.supports_plugins(): return False
+        return subprocess.run(["hyprpm","add",url],
+                               stderr=subprocess.DEVNULL).returncode == 0
+
+
+def detect(): return Compositor(_detect_name())
+
+if __name__ == "__main__":
+    import sys
+    wm = detect()
+    if "--json" in sys.argv:
+        print(json.dumps({"name":wm.name,"config":wm.get_config_path(),
+                           "plugins":wm.supports_plugins()}))
+    else:
+        print(wm.name)

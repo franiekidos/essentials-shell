@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+essentials-osd  — Volume & Brightness OSD
+
+Usage:
+  essentials-osd volume   up|down|mute|<0-100>
+  essentials-osd bright   up|down|<0-100>
+
+Shows a translucent pill OSD for 2 seconds then exits.
+Designed to be bound to media/brightness keys in your compositor config.
+
+Hyprland example:
+  bind = , XF86AudioRaiseVolume,  exec, python3 ~/.local/bin/essentials-osd volume up
+  bind = , XF86AudioLowerVolume,  exec, python3 ~/.local/bin/essentials-osd volume down
+  bind = , XF86AudioMute,         exec, python3 ~/.local/bin/essentials-osd volume mute
+  bind = , XF86MonBrightnessUp,   exec, python3 ~/.local/bin/essentials-osd bright up
+  bind = , XF86MonBrightnessDown, exec, python3 ~/.local/bin/essentials-osd bright down
+
+Sway example:
+  bindsym XF86AudioRaiseVolume  exec python3 ~/.local/bin/essentials-osd volume up
+  bindsym XF86AudioLowerVolume  exec python3 ~/.local/bin/essentials-osd volume down
+  bindsym XF86AudioMute         exec python3 ~/.local/bin/essentials-osd volume mute
+  bindsym XF86MonBrightnessUp   exec python3 ~/.local/bin/essentials-osd bright up
+  bindsym XF86MonBrightnessDown exec python3 ~/.local/bin/essentials-osd bright down
+"""
+import gi, os, json, subprocess, sys
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk
+
+THEME_PATH  = os.path.expanduser("~/.config/essentials/themes.json")
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+OSD_DURATION_MS = 2200   # how long the OSD stays visible
+
+def _load_theme():
+    try:
+        data    = json.load(open(THEME_PATH))
+        current = data.get("current","catppuccin")
+        return data.get(current, data.get("catppuccin",{}))
+    except:
+        return {"bg":"rgba(17,17,27,0.95)","accent":"#cba6f7","text":"#cdd6f4"}
+
+T = _load_theme()
+
+def _run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd),text=True,stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+def _run_ok(*cmd):
+    try:    return subprocess.run(list(cmd),stderr=subprocess.DEVNULL).returncode == 0
+    except: return False
+
+# ── Value getters / setters ───────────────────────────────────────────────────
+
+def get_volume():
+    out = _run("wpctl","get-volume","@DEFAULT_AUDIO_SINK@")
+    try:
+        muted = "[MUTED]" in out
+        val   = int(float(out.split(":")[1].strip().split()[0]) * 100)
+        return val, muted
+    except: return 50, False
+
+def set_volume(action):
+    val, muted = get_volume()
+    if action == "up":
+        _run_ok("wpctl","set-volume","-l","1.0","@DEFAULT_AUDIO_SINK@","5%+")
+    elif action == "down":
+        _run_ok("wpctl","set-volume","@DEFAULT_AUDIO_SINK@","5%-")
+    elif action == "mute":
+        _run_ok("wpctl","set-mute","@DEFAULT_AUDIO_SINK@","toggle")
+    elif action.isdigit():
+        _run_ok("wpctl","set-volume","@DEFAULT_AUDIO_SINK@",f"{int(action)/100:.2f}")
+    return get_volume()
+
+def get_brightness():
+    try:
+        c = int(_run("brightnessctl","g") or 0)
+        m = int(_run("brightnessctl","m") or 1)
+        return max(1, int(c/m*100))
+    except: return 50
+
+def set_brightness(action):
+    if action == "up":
+        _run_ok("brightnessctl","set","5%+")
+    elif action == "down":
+        _run_ok("brightnessctl","set","5%-")
+    elif action.isdigit():
+        _run_ok("brightnessctl","set",f"{action}%")
+    return get_brightness()
+
+# ── OSD window ────────────────────────────────────────────────────────────────
+
+class OSD(Gtk.Window):
+    def __init__(self, kind, action):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, 60)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+
+        # ── Apply action & get new value ──────────────────────────────────────
+        if kind == "volume":
+            val, muted = set_volume(action)
+            if muted:
+                icon, label, pct = "󰝟", "Volume", "Muted"
+            else:
+                icon = "󰕾" if val > 50 else "󰖀" if val > 0 else "󰕿"
+                label, pct = "Volume", f"{val}%"
+            fraction = 0.0 if muted else val / 100
+        else:
+            val      = set_brightness(action)
+            icon     = "󰃠" if val > 50 else "󰃟"
+            label, pct = "Brightness", f"{val}%"
+            fraction = val / 100
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_name("osd-box")
+        outer.set_margin_start(24); outer.set_margin_end(24)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        self.add(outer)
+
+        top = Gtk.Box(spacing=14)
+        icon_lbl  = Gtk.Label(label=icon); icon_lbl.set_name("osd-icon")
+        label_lbl = Gtk.Label(label=label); label_lbl.set_name("osd-label")
+        pct_lbl   = Gtk.Label(label=pct); pct_lbl.set_name("osd-pct")
+        top.pack_start(icon_lbl,  False, False, 0)
+        top.pack_start(label_lbl, False, False, 0)
+        top.pack_end(pct_lbl,     False, False, 0)
+        outer.pack_start(top, False, False, 0)
+
+        bar = Gtk.ProgressBar()
+        bar.set_fraction(fraction)
+        bar.set_name("osd-bar")
+        outer.pack_start(bar, False, False, 0)
+
+        self._apply_style()
+        self.show_all()
+        GLib.timeout_add(OSD_DURATION_MS, Gtk.main_quit)
+
+    def _apply_style(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+            #osd-box {{
+                background-color: {T.get('bg','rgba(17,17,27,0.95)')};
+                border:           1px solid rgba(255,255,255,0.10);
+                border-radius:    16px;
+                min-width:        280px;
+            }}
+            #osd-icon  {{ font-size: 22px; color: {T.get('accent','#cba6f7')}; }}
+            #osd-label {{ font-size: 14px; font-weight: bold;
+                          font-family: 'JetBrainsMono Nerd Font'; }}
+            #osd-pct   {{ font-size: 13px; color: {T.get('subtext',T.get('text','#a6adc8'))};
+                          font-family: 'JetBrainsMono Nerd Font'; }}
+            #osd-bar trough  {{ background-color: rgba(255,255,255,0.10);
+                                min-height: 8px; border-radius: 4px; }}
+            #osd-bar progress {{ background-color: {T.get('accent','#cba6f7')};
+                                 border-radius: 4px; }}
+            * {{ font-family: 'JetBrainsMono Nerd Font', monospace;
+                 color: {T.get('text','#cdd6f4')}; }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if len(args) < 2 or args[0] not in ("volume","bright"):
+        print(__doc__)
+        sys.exit(0)
+    OSD(args[0], args[1])
+    Gtk.main()

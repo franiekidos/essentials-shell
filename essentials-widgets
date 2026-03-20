@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+essentials-widgets — Desktop widgets (rendered on the wallpaper layer)
+
+Widgets available:
+  clock   — Large clock with date
+  media   — Currently playing track with controls
+  sysinfo — CPU / RAM / disk / temp at a glance
+
+Configured via ~/.config/essentials/config.json:
+  "widgets": {
+    "enabled": ["clock","sysinfo"],
+    "clock":   {"x":60,"y":60,"corner":"top-left"},
+    "sysinfo": {"x":60,"y":60,"corner":"bottom-left"}
+  }
+"""
+import gi, os, json, subprocess, psutil, datetime, importlib.util
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk
+
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+def _load_config():
+    try:
+        with open(CONFIG_PATH) as f: return json.load(f)
+    except: return {}
+
+def _load_theme():
+    try:
+        data = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
+        cur  = data.get("current","catppuccin")
+        return data.get(cur, data.get("catppuccin",{}))
+    except:
+        return {"bg":"rgba(0,0,0,0.45)","accent":"#cba6f7","text":"#cdd6f4"}
+
+CFG = _load_config()
+T   = _load_theme()
+WIDGET_CFG = CFG.get("widgets", {"enabled":["clock","sysinfo"]})
+
+def _run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd),text=True,stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+def _defer(fn):
+    GLib.idle_add(lambda: (fn(), False)[1])
+
+def _repeat(ms, fn):
+    def _tick(): fn(); return True
+    GLib.idle_add(lambda: (GLib.timeout_add(ms, _tick), False)[1])
+
+
+# ── Widget windows ────────────────────────────────────────────────────────────
+
+class BaseWidget(Gtk.Window):
+    """Common setup for all desktop widgets."""
+    def __init__(self, corner="top-left", margin=40):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.BACKGROUND)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+
+        anchors = {
+            "top-left":     (True,  False, True,  False),
+            "top-right":    (True,  False, False, True),
+            "bottom-left":  (False, True,  True,  False),
+            "bottom-right": (False, True,  False, True),
+            "center":       (False, False, False, False),
+        }.get(corner, (True, False, True, False))
+
+        edges = (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                 GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT)
+        for edge, val in zip(edges, anchors):
+            GtkLayerShell.set_anchor(self, edge, val)
+            if val: GtkLayerShell.set_margin(self, edge, margin)
+
+        self.set_app_paintable(True)
+        self.connect("draw", self._on_draw)
+
+    def _on_draw(self, w, cr):
+        # Transparent background
+        cr.set_source_rgba(0,0,0,0)
+        cr.set_operator(1)  # CLEAR
+        cr.paint()
+        cr.set_operator(2)  # OVER
+        return False
+
+
+class ClockWidget(BaseWidget):
+    def __init__(self):
+        cfg    = WIDGET_CFG.get("clock",{})
+        corner = cfg.get("corner","top-left")
+        super().__init__(corner=corner, margin=cfg.get("margin",48))
+
+        self.set_name("widget-clock")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_name("widget-box"); box.set_halign(Gtk.Align.START)
+        box.set_margin_start(0); box.set_margin_top(0)
+        self.add(box)
+
+        self._time_lbl = Gtk.Label(); self._time_lbl.set_name("clock-time")
+        self._time_lbl.set_halign(Gtk.Align.START)
+        self._date_lbl = Gtk.Label(); self._date_lbl.set_name("clock-date")
+        self._date_lbl.set_halign(Gtk.Align.START)
+        box.pack_start(self._time_lbl, False, False, 0)
+        box.pack_start(self._date_lbl, False, False, 0)
+
+        def upd():
+            now = datetime.datetime.now()
+            self._time_lbl.set_text(now.strftime("%H:%M"))
+            self._date_lbl.set_text(now.strftime("%A, %d %B"))
+        _defer(upd); _repeat(5000, upd)
+        self.show_all()
+
+
+class SysinfoWidget(BaseWidget):
+    def __init__(self):
+        cfg    = WIDGET_CFG.get("sysinfo",{})
+        corner = cfg.get("corner","bottom-left")
+        super().__init__(corner=corner, margin=cfg.get("margin",48))
+
+        self.set_name("widget-sysinfo")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_name("widget-box"); self.add(box)
+
+        self._rows = {}
+        for key, icon in [("cpu","󰍛 CPU"),("ram","󰘚 RAM"),
+                           ("disk","󰋊 Disk"),("temp","󰔏 Temp")]:
+            row = Gtk.Box(spacing=10)
+            lbl = Gtk.Label(label=icon); lbl.set_name("sysinfo-icon")
+            val = Gtk.Label(label="--");  val.set_name("sysinfo-val")
+            row.pack_start(lbl, False, False, 0)
+            row.pack_start(val, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            self._rows[key] = val
+
+        def upd():
+            self._rows["cpu"].set_text(f"{int(psutil.cpu_percent())}%")
+            self._rows["ram"].set_text(f"{int(psutil.virtual_memory().percent)}%")
+            try: self._rows["disk"].set_text(f"{int(psutil.disk_usage('/').percent)}%")
+            except: self._rows["disk"].set_text("--")
+            try:
+                t = next(iter(psutil.sensors_temperatures().values()))[0].current
+                self._rows["temp"].set_text(f"{int(t)}°C")
+            except: self._rows["temp"].set_text("--")
+        _defer(upd); _repeat(5000, upd)
+        self.show_all()
+
+
+class MediaWidget(BaseWidget):
+    def __init__(self):
+        cfg    = WIDGET_CFG.get("media",{})
+        corner = cfg.get("corner","bottom-right")
+        super().__init__(corner=corner, margin=cfg.get("margin",48))
+
+        self.set_name("widget-media")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_name("widget-box"); self.add(box)
+
+        self._title  = Gtk.Label(); self._title.set_name("media-title-w")
+        self._title.set_halign(Gtk.Align.START); self._title.set_ellipsize(3)
+        self._artist = Gtk.Label(); self._artist.set_name("media-artist-w")
+        self._artist.set_halign(Gtk.Align.START); self._artist.set_ellipsize(3)
+        box.pack_start(self._title,  False, False, 0)
+        box.pack_start(self._artist, False, False, 0)
+
+        ctrl = Gtk.Box(spacing=4)
+        for icon, cmd in [("󰒮","previous"),("󰐊","play-pause"),("󰒭","next")]:
+            b = Gtk.Button(label=icon); b.set_name("media-btn-w")
+            b.connect("clicked", lambda _, c=cmd: subprocess.run(
+                ["playerctl",c], stderr=subprocess.DEVNULL))
+            ctrl.pack_start(b, False, False, 0)
+        box.pack_start(ctrl, False, False, 0)
+
+        def upd():
+            title  = _run("playerctl","metadata","title")
+            artist = _run("playerctl","metadata","artist")
+            status = _run("playerctl","status", fallback="Stopped")
+            if title:
+                self._title.set_text(title[:30])
+                self._artist.set_text(artist[:30] if artist else "Unknown")
+                self.show_all()
+            else:
+                self.hide()
+        _defer(upd); _repeat(3000, upd)
+        self.show_all()
+
+
+# ── Stylesheet ────────────────────────────────────────────────────────────────
+css = Gtk.CssProvider()
+css.load_from_data(f"""
+    * {{ font-family: 'JetBrainsMono Nerd Font', monospace; }}
+    #widget-box {{ }}
+    .clock-time, #clock-time {{
+        font-size:   72px;
+        font-weight: bold;
+        color:       {T.get('text','#cdd6f4')};
+        text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+    }}
+    #clock-date {{
+        font-size:  18px;
+        color:      {T.get('subtext', T.get('text','#a6adc8'))};
+        text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    }}
+    #sysinfo-icon {{ font-size: 13px; color: {T.get('accent','#cba6f7')};
+                     min-width: 70px; }}
+    #sysinfo-val  {{ font-size: 13px; color: {T.get('text','#cdd6f4')}; }}
+    #media-title-w  {{ font-size: 14px; font-weight: bold;
+                       color: {T.get('text','#cdd6f4')};
+                       text-shadow: 0 1px 4px rgba(0,0,0,0.9); }}
+    #media-artist-w {{ font-size: 12px;
+                       color: {T.get('subtext',T.get('text','#a6adc8'))};
+                       text-shadow: 0 1px 4px rgba(0,0,0,0.9); }}
+    #media-btn-w {{
+        background-color: rgba(0,0,0,0.35); border: none; border-radius: 50%;
+        color: {T.get('text','#cdd6f4')}; font-size: 16px;
+        padding: 6px; min-width: 32px; min-height: 32px;
+    }}
+    #media-btn-w:hover {{ background-color: rgba(203,166,247,0.3); }}
+""".encode())
+Gtk.StyleContext.add_provider_for_screen(
+    Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+# ── Launch enabled widgets ────────────────────────────────────────────────────
+enabled = WIDGET_CFG.get("enabled", ["clock"])
+widget_map = {"clock":ClockWidget, "sysinfo":SysinfoWidget, "media":MediaWidget}
+for name in enabled:
+    cls = widget_map.get(name)
+    if cls:
+        try: cls()
+        except Exception as e: print(f"[widgets] {name} failed: {e}")
+
+Gtk.main()

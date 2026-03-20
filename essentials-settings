@@ -1,0 +1,1882 @@
+#!/usr/bin/env python3
+import gi, os, json, subprocess, shutil, importlib.util
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, Gdk, GLib, Pango
+
+# ── Load config-writer ───────────────────────────────────────────────────────
+def _load_cw():
+    path = os.path.expanduser("~/.local/bin/essentials-config-writer")
+    if os.path.exists(path):
+        try:
+            spec = importlib.util.spec_from_file_location("essentials_config_writer", path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception as e:
+            print(f"[settings] config-writer load failed: {e}")
+    return None
+
+CW = _load_cw()   # the config-writer module, or None
+
+THEME_PATH  = os.path.expanduser("~/.config/essentials/themes.json")
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+# ── Load compositor abstraction ───────────────────────────────────────────────
+def _load_wm():
+    path = os.path.expanduser("~/.local/bin/essentials-detect")
+    if os.path.exists(path):
+        try:
+            spec = importlib.util.spec_from_file_location("essentials_detect", path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod.detect()
+        except Exception as e:
+            import warnings; warnings.warn(f"essentials-detect failed: {e}")
+    class _FB:
+        name="generic"
+        def get_config_path(self): return None
+        def get_monitors(self):    return []
+        def set_monitor(self,*a):  return False
+        def get_input_devices(self): return []
+        def set_input(self,*a):    return False
+        def parse_keybinds(self,l): return []
+        def format_keybind(self,m,k,c): return f"# {m}+{k} {c}"
+        def reload_config(self):   return False
+        def supports_plugins(self): return False
+        def get_plugins(self):     return []
+        def plugin_action(self,*a): return False
+        def add_plugin_repo(self,u): return False
+    return _FB()
+
+WM = _load_wm()
+
+def _has(cmd): return shutil.which(cmd) is not None
+def _run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd),text=True,stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+
+class EssentialsSettings(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        self.connect("key-press-event", self.on_key_press)
+        self.theme_checks = {}
+        self.dark_mode = self._load_dark_mode()
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root)
+
+        # Header
+        hdr = Gtk.Box(spacing=10)
+        hdr.set_margin_start(20); hdr.set_margin_end(20); hdr.set_margin_top(14)
+        self._header_title = Gtk.Label()
+        self._header_title.set_markup(
+            f"<span size='large' weight='bold'>Essentials Settings  "
+            f"<span size='small'>[{WM.name}]</span></span>")
+        title = self._header_title
+        close_btn = Gtk.Button(label="✕"); close_btn.set_size_request(32,32)
+        close_btn.connect("clicked", lambda w: Gtk.main_quit())
+        hdr.pack_start(title, False, False, 0)
+        hdr.pack_end(close_btn, False, False, 0)
+        root.pack_start(hdr, False, False, 14)
+
+        self.notebook = Gtk.Notebook()
+        root.pack_start(self.notebook, True, True, 0)
+
+        self._build_display_tab()
+        self._build_appearance_tab()
+        self._build_system_tab()
+        self._build_network_tab()
+        self._build_input_tab()
+        self._build_clock_tab()
+        self._build_keybinds_tab()
+        self._build_fonts_tab()
+        self._build_defaults_tab()
+        self._build_plugins_tab()
+        self._build_layout_tab()
+        self._build_wallpaper_tab()
+        self._build_widgets_tab()
+
+        self.apply_style()
+        self.set_size_request(1200, 740)
+        self.show_all()
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+    def _load_dark_mode(self):
+        try:
+            with open(CONFIG_PATH) as f: return json.load(f).get("dark_mode", True)
+        except: return True
+
+    def _save_dark_mode(self, val):
+        data = {}
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: pass
+        data["dark_mode"] = val
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+    def _get_sys_val(self, kind):
+        try:
+            if kind == "vol":
+                out = _run("wpctl","get-volume","@DEFAULT_AUDIO_SINK@")
+                return int(float(out.split(":")[1].strip().split()[0]) * 100)
+            if kind == "bri":
+                c = int(_run("brightnessctl","g") or 0)
+                m = int(_run("brightnessctl","m") or 1)
+                return int(c/m*100)
+        except: return 50
+
+    def _tab(self, widget, label, hm=28, vm=20):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        widget.set_margin_start(hm); widget.set_margin_end(hm)
+        widget.set_margin_top(vm);   widget.set_margin_bottom(vm)
+        scroll.add(widget)
+        self.notebook.append_page(scroll, Gtk.Label(label=label))
+
+    def _section(self, text):
+        l = Gtk.Label(); l.set_halign(Gtk.Align.START)
+        l.set_markup(f"<span weight='bold' size='small'>{text.upper()}</span>")
+        l.set_name("section-heading"); return l
+
+    def _entry_row(self, box, label, default, spacing=5):
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+        lbl = Gtk.Label(label=label); lbl.set_halign(Gtk.Align.START)
+        ent = Gtk.Entry(); ent.set_text(default)
+        row.pack_start(lbl, False, False, 0)
+        row.pack_start(ent, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        return ent
+
+    def _msg(self, text, mtype=Gtk.MessageType.INFO):
+        dlg = Gtk.MessageDialog(parent=self, flags=Gtk.DialogFlags.MODAL,
+            message_type=mtype, buttons=Gtk.ButtonsType.OK, text=text)
+        dlg.run(); dlg.destroy()
+
+    # ── Display tab ───────────────────────────────────────────────────────────
+    def _build_display_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        left.set_margin_start(24); left.set_margin_end(24); left.set_margin_top(24)
+
+        self.mon_entry = self._entry_row(left, "Monitor ID:",      "eDP-1")
+        self.res_entry = self._entry_row(left, "Resolution @ Hz:", "preferred")
+        self.rot_entry = self._entry_row(left, "Rotation (0-7):",  "0")
+        self.scale_entry = self._entry_row(left, "Scale:",         "1.0")
+
+        btns = Gtk.Box(spacing=10)
+        a_btn = Gtk.Button(label="Apply"); a_btn.connect("clicked", self._apply_display)
+        r_btn = Gtk.Button(label="Reset"); r_btn.connect("clicked",
+            lambda w: (self.res_entry.set_text("preferred"),
+                       self.rot_entry.set_text("0"), self.scale_entry.set_text("1.0")))
+        reload_btn = Gtk.Button(label="󰑓 Reload Config"); reload_btn.set_name("btn-blue")
+        reload_btn.connect("clicked", lambda w: WM.reload_config())
+        btns.pack_start(a_btn,      True, True, 0)
+        btns.pack_start(r_btn,      True, True, 0)
+        btns.pack_start(reload_btn, True, True, 0)
+        left.pack_start(btns, False, False, 8)
+
+        # Compositor capability badge
+        cap_lbl = Gtk.Label(label=f"Compositor: {WM.name}  |  "
+            f"wlr-randr: {'yes' if _has('wlr-randr') else 'no'}")
+        cap_lbl.set_name("mono-lbl"); cap_lbl.set_halign(Gtk.Align.START)
+        left.pack_start(cap_lbl, False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right.set_size_request(360,-1); right.set_name("help-panel")
+        right.set_margin_start(8); right.set_margin_end(8)
+        right.set_margin_top(8);   right.set_margin_bottom(8)
+        rscroll = Gtk.ScrolledWindow()
+        self.modes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        rscroll.add(self.modes_box)
+        right.pack_start(rscroll, True, True, 0)
+        box.pack_start(left,  True,  True,  0)
+        box.pack_start(right, False, False, 0)
+        self.notebook.append_page(box, Gtk.Label(label="󰍹 Display"))
+        GLib.idle_add(self._populate_modes)
+
+    def _populate_modes(self):
+        for c in self.modes_box.get_children(): self.modes_box.remove(c)
+        for m in WM.get_monitors():
+            self.modes_box.pack_start(
+                self._section(m.get("name","?")), False, False, 4)
+            for mode in m.get("modes",[]):
+                lbl = f"{mode['res']}@{mode['refresh']}Hz"
+                b = Gtk.Button(label=lbl)
+                b.connect("clicked", lambda w, mon=m["name"], r=lbl: (
+                    self.mon_entry.set_text(mon),
+                    self.res_entry.set_text(r)))
+                self.modes_box.pack_start(b, False, False, 0)
+        if not WM.get_monitors():
+            self.modes_box.pack_start(
+                Gtk.Label(label="(no monitors via IPC)"), False, False, 5)
+        self.modes_box.show_all()
+        return False
+
+    def _apply_display(self, _b):
+        name  = self.mon_entry.get_text().strip()
+        res   = self.res_entry.get_text().strip()
+        rot   = int(self.rot_entry.get_text() or 0)
+        scale = float(self.scale_entry.get_text() or 1.0)
+
+        # 1. Write to config file
+        conf  = WM.get_config_path()
+        wrote = False
+        if CW and conf:
+            writer = CW.get_writer(WM.name, conf)
+            if writer and hasattr(writer, "set_monitor"):
+                try:
+                    writer.set_monitor(name, res, "auto", scale, rot)
+                    wrote = True
+                except Exception as e:
+                    self._msg(f"Config write failed: {e}", Gtk.MessageType.ERROR)
+                    return
+
+        # 2. Apply live via IPC
+        ok = WM.set_monitor(name, res, rot, scale)
+
+        if wrote and ok:
+            self._msg(f"Applied and saved to {conf}")
+        elif wrote:
+            self._msg(f"Saved to {conf}\n(live apply not supported for {WM.name} — reload compositor to apply)")
+        elif ok:
+            self._msg(f"Applied live.\nNote: not written to config — changes lost on restart.")
+        else:
+            self._msg(
+                f"Could not apply or write monitor config for {WM.name}.",
+                Gtk.MessageType.WARNING)
+
+    # ── Appearance tab ────────────────────────────────────────────────────────
+    def _build_appearance_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        # Dark mode row
+        dm_row = Gtk.Box(spacing=15); dm_row.set_name("theme-row")
+        self._dm_icon = Gtk.Label(label="󰖔 " if self.dark_mode else "󰖙 ")
+        self._dm_icon.set_name("dm-icon")
+        dm_lbl = Gtk.Label(); dm_lbl.set_markup("<b>Dark Mode</b>"); dm_lbl.set_name("theme-text")
+        self._dm_sub = Gtk.Label(label="Dark" if self.dark_mode else "Light")
+        self._dm_sub.set_name("dm-sub")
+        self.dm_switch = Gtk.Switch(); self.dm_switch.set_active(self.dark_mode)
+        self.dm_switch.connect("notify::active", self._on_dark_toggle)
+        dl = Gtk.Box(spacing=10)
+        dl.pack_start(self._dm_icon, False, False, 10)
+        dl.pack_start(dm_lbl,        False, False, 0)
+        dl.pack_start(self._dm_sub,  False, False, 4)
+        dm_row.pack_start(dl,             True,  True,  0)
+        dm_row.pack_start(self.dm_switch, False, False, 10)
+        page.pack_start(dm_row, False, False, 0)
+        page.pack_start(Gtk.Separator(), False, False, 4)
+
+        page.pack_start(self._section("Themes"), False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        self._theme_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._populate_themes()
+        scroll.add(self._theme_list)
+        page.pack_start(scroll, True, True, 0)
+
+        self._theme_status_lbl = Gtk.Label(label="")
+        self._theme_status_lbl.set_halign(Gtk.Align.START)
+        self._theme_status_lbl.set_name("mono-lbl")
+        page.pack_start(self._theme_status_lbl, False, False, 0)
+
+        self._tab(page, "󰏘 Appearance")
+
+    def _populate_themes(self):
+        for c in self._theme_list.get_children(): self._theme_list.remove(c)
+        if not os.path.exists(THEME_PATH): return
+        with open(THEME_PATH) as f:
+            data = json.load(f); current = data.get("current","")
+        for name in [k for k in data if k != "current"]:
+            row = Gtk.Box(spacing=16); row.set_name("theme-row")
+            cb = Gtk.CheckButton(); cb.set_active(name == current)
+            cb.connect("toggled", self._on_theme_toggle, name)
+            self.theme_checks[name] = cb
+            # Colour swatches
+            theme = data[name]
+            swatch_box = Gtk.Box(spacing=4)
+            for key in ("bg","accent","text"):
+                swatch = Gtk.Label(label="  ")
+                swatch.set_name("swatch")
+                ctx = swatch.get_style_context()
+                css = Gtk.CssProvider()
+                css.load_from_data(f"* {{ background-color: {theme.get(key,'#888')}; border-radius: 3px; }}".encode())
+                ctx.add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                swatch_box.pack_start(swatch, False, False, 0)
+            lbl = Gtk.Label(label=name.capitalize()); lbl.set_name("theme-text")
+            row.pack_start(cb,          False, False, 10)
+            row.pack_start(lbl,         False, False,  0)
+            row.pack_end(swatch_box,    False, False, 10)
+            self._theme_list.pack_start(row, False, False, 0)
+        self._theme_list.show_all()
+
+    def _on_theme_toggle(self, cb, name):
+        if not cb.get_active(): return
+        for t, o in self.theme_checks.items():
+            if t != name: o.set_active(False)
+        with open(THEME_PATH) as f: data = json.load(f)
+        data["current"] = name
+        theme = data.get(name, {})
+        with open(THEME_PATH,"w") as f: json.dump(data,f,indent=4)
+        # Apply WM borders immediately in-process
+        wm_msg = ""
+        if CW:
+            conf = WM.get_config_path()
+            ok, msg = CW.apply_wm_theme(WM.name, conf, theme)
+            wm_msg = f"{'✓' if ok else '✗'} WM borders: {msg}"
+            print(f"[settings] {wm_msg}")
+
+        # Show brief result in a status label if present, else print
+        if hasattr(self, "_theme_status_lbl"):
+            p2 = self._palette()
+            col = p2.get("green","#a6e3a1") if (not wm_msg or wm_msg.startswith("✓")) else p2.get("red","#f38ba8")
+            self._theme_status_lbl.set_markup(f"<span foreground='{col}'>{wm_msg}</span>")
+
+        # Restart bar + widgets with new theme
+        subprocess.Popen(["python3", os.path.expanduser("~/.local/bin/essentials-theme-apply")])
+        # Re-render settings UI with new palette
+        self.apply_style()
+
+    def _on_dark_toggle(self, sw, _p):
+        self.dark_mode = sw.get_active()
+        self._dm_icon.set_text("󰖔 " if self.dark_mode else "󰖙 ")
+        self._dm_sub.set_text("Dark" if self.dark_mode else "Light")
+        self._save_dark_mode(self.dark_mode)
+        self.apply_style()
+
+    # ── System tab ────────────────────────────────────────────────────────────
+    def _build_system_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22)
+
+        box.pack_start(self._section("Audio"), False, False, 0)
+        vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vh = Gtk.Box(spacing=10)
+        self._v_lbl = Gtk.Label(); self._v_lbl.set_halign(Gtk.Align.START)
+        m_btn = Gtk.Button(label="󰝟 Mute"); m_btn.set_name("mute-btn")
+        m_btn.connect("clicked", lambda w: subprocess.run(
+            ["wpctl","set-mute","@DEFAULT_AUDIO_SINK@","toggle"]))
+        vh.pack_start(self._v_lbl, True, True, 0)
+        vh.pack_start(m_btn,       False, False, 0)
+        cur_v = self._get_sys_val("vol")
+        self._v_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self._v_scale.set_value(cur_v)
+        self._v_lbl.set_markup(f"󰕾 <b>Volume:</b> {cur_v}%")
+        self._v_scale.connect("value-changed", lambda w: (
+            self._v_lbl.set_markup(f"󰕾 <b>Volume:</b> {int(w.get_value())}%"),
+            subprocess.run(["wpctl","set-volume","@DEFAULT_AUDIO_SINK@",
+                            f"{w.get_value()/100:.2f}"])))
+        vol_box.pack_start(vh,          False, False, 0)
+        vol_box.pack_start(self._v_scale, False, False, 0)
+        box.pack_start(vol_box, False, False, 0)
+
+        box.pack_start(self._section("Brightness"), False, False, 0)
+        bri_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._b_lbl = Gtk.Label(); self._b_lbl.set_halign(Gtk.Align.START)
+        cur_b = self._get_sys_val("bri")
+        self._b_lbl.set_markup(f"󰃠 <b>Brightness:</b> {cur_b}%")
+        self._b_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 100, 1)
+        self._b_scale.set_value(cur_b)
+        self._b_scale.connect("value-changed", lambda w: (
+            self._b_lbl.set_markup(f"󰃠 <b>Brightness:</b> {int(w.get_value())}%"),
+            subprocess.run(["brightnessctl","set",f"{int(w.get_value())}%"])))
+        bri_box.pack_start(self._b_lbl,   False, False, 0)
+        bri_box.pack_start(self._b_scale, False, False, 0)
+        box.pack_start(bri_box, False, False, 0)
+
+        box.pack_start(self._section("Power"), False, False, 0)
+        p_btns = Gtk.Box(spacing=12)
+        for lbl, cmd, name in [
+            ("󰤄 Suspend",  ["systemctl","suspend"],   "btn-yellow"),
+            ("󰑐 Reboot",   ["reboot"],                "btn-blue"),
+            ("󰐥 Power Off",["shutdown","now"],         "btn-red"),
+        ]:
+            b = Gtk.Button(label=lbl); b.set_name(name)
+            b.connect("clicked", lambda w, c=cmd: subprocess.run(c))
+            p_btns.pack_start(b, True, True, 0)
+        box.pack_end(p_btns, False, False, 0)
+        self._tab(box, "󰒓 System")
+
+    # ── Network tab ───────────────────────────────────────────────────────────
+    def _build_network_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        if not _has("nmcli"):
+            page.pack_start(Gtk.Label(label="nmcli not found — install NetworkManager"),
+                            False, False, 20)
+            self._tab(page, "󰖩 Network"); return
+
+        top = Gtk.Box(spacing=12)
+        top.pack_start(self._section("Wi-Fi"), False, False, 0)
+        self._wifi_sw = Gtk.Switch()
+        self._wifi_sw.set_active(_run("nmcli","radio","wifi") == "enabled")
+        self._wifi_sw.connect("notify::active", lambda sw,_: (
+            subprocess.run(["nmcli","radio","wifi","on" if sw.get_active() else "off"],
+                           stderr=subprocess.DEVNULL),
+            GLib.timeout_add(1000, lambda: (self._scan_wifi(None), False))))
+        top.pack_end(self._wifi_sw, False, False, 0)
+        page.pack_start(top, False, False, 0)
+
+        scan_row = Gtk.Box(spacing=10)
+        self._wifi_status = Gtk.Label(label="")
+        self._wifi_status.set_halign(Gtk.Align.START)
+        scan_btn = Gtk.Button(label="󰑓 Scan"); scan_btn.set_name("small-btn")
+        scan_btn.connect("clicked", self._scan_wifi)
+        scan_row.pack_start(self._wifi_status, True,  True,  0)
+        scan_row.pack_end(scan_btn,            False, False, 0)
+        page.pack_start(scan_row, False, False, 0)
+
+        net_scroll = Gtk.ScrolledWindow()
+        net_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        net_scroll.set_min_content_height(240)
+        self._net_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        net_scroll.add(self._net_list)
+        page.pack_start(net_scroll, True, True, 0)
+
+        page.pack_start(self._section("Active Connection"), False, False, 0)
+        self._active_net = Gtk.Label(label="")
+        self._active_net.set_halign(Gtk.Align.START); self._active_net.set_name("mono-lbl")
+        page.pack_start(self._active_net, False, False, 0)
+
+        self._tab(page, "󰖩 Network")
+        GLib.idle_add(self._scan_wifi, None)
+
+    def _scan_wifi(self, _btn):
+        self._wifi_status.set_text("Scanning…")
+        for c in self._net_list.get_children(): self._net_list.remove(c)
+        raw = _run("nmcli","-t","-f","IN-USE,SSID,SIGNAL,SECURITY","dev","wifi","list")
+        seen = set()
+        for line in raw.splitlines():
+            parts = line.split(":")
+            if len(parts) < 4: continue
+            active, ssid, signal, sec = parts[0], parts[1], parts[2], parts[3]
+            if not ssid or ssid in seen: continue
+            seen.add(ssid)
+            try: sig = int(signal)
+            except: sig = 0
+            sig_icon = "󰤨" if sig > 65 else "󰤥" if sig > 35 else "󰤢"
+            lock = "󰌾 " if sec and sec != "--" else ""
+            row = Gtk.Box(spacing=10); row.set_name("net-row")
+            lbl = Gtk.Label(label=f"{sig_icon}  {ssid}  {lock}")
+            lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
+            lbl.set_name("net-active-lbl" if active == "*" else "net-lbl")
+            btn = Gtk.Button(label="Disconnect" if active == "*" else "Connect")
+            btn.set_name("small-btn-accent" if active == "*" else "small-btn")
+            btn.connect("clicked", lambda w, s=ssid, a=(active=="*"): self._wifi_connect(s, a))
+            row.pack_start(lbl, True,  True,  0)
+            row.pack_start(btn, False, False, 0)
+            self._net_list.pack_start(row, False, False, 0)
+        self._net_list.show_all()
+        active_raw = _run("nmcli","-t","-f","DEVICE,TYPE,STATE,CONNECTION","con","show","--active")
+        self._active_net.set_text(active_raw[:140] if active_raw else "None")
+        self._wifi_status.set_text(f"{len(seen)} networks found")
+        return False
+
+    def _wifi_connect(self, ssid, disconnect):
+        if disconnect:
+            subprocess.run(["nmcli","con","down",ssid], stderr=subprocess.DEVNULL)
+        else:
+            if subprocess.run(["nmcli","con","up",ssid],
+                              stderr=subprocess.DEVNULL).returncode != 0:
+                self._wifi_password_dialog(ssid)
+        GLib.timeout_add(1500, lambda: (self._scan_wifi(None), False))
+
+    def _wifi_password_dialog(self, ssid):
+        dlg = Gtk.Dialog(title=f"Connect to {ssid}", parent=self,
+                         flags=Gtk.DialogFlags.MODAL)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                        "Connect", Gtk.ResponseType.OK)
+        c = dlg.get_content_area()
+        c.set_margin_start(18); c.set_margin_end(18)
+        c.set_margin_top(14);   c.set_margin_bottom(14)
+        c.pack_start(Gtk.Label(label=f"Password for {ssid}:"), False, False, 4)
+        pw = Gtk.Entry(); pw.set_visibility(False); pw.set_placeholder_text("Password")
+        c.pack_start(pw, False, False, 4)
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            subprocess.run(["nmcli","dev","wifi","connect",ssid,"password",pw.get_text()],
+                           stderr=subprocess.DEVNULL)
+        dlg.destroy()
+
+    # ── Mouse & Input tab ─────────────────────────────────────────────────────
+    def _build_input_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+
+        # ── What we can actually do note ──────────────────────────────────────
+        wm_note = {
+            "hyprland": "Reads/writes input { } block in hyprland.conf. Applied live via hyprctl.",
+            "sway":     "Reads/writes input blocks in sway config. Applied live via swaymsg.",
+            "niri":     "Writes input section in config.kdl. Reload compositor to apply.",
+            "river":    "Writes riverctl input lines in init. Reload compositor to apply.",
+        }.get(WM.name, f"{WM.name}: config file only — no live IPC for input.")
+        note = Gtk.Label(label=f"󰍽  {wm_note}")
+        note.set_name("mono-lbl"); note.set_halign(Gtk.Align.START)
+        note.set_line_wrap(True)
+        page.pack_start(note, False, False, 0)
+        page.pack_start(Gtk.Separator(), False, False, 2)
+
+        # ── Read current values from config file ──────────────────────────────
+        current = self._read_input_config()
+
+        # ── Pointer speed ─────────────────────────────────────────────────────
+        page.pack_start(self._section("Pointer"), False, False, 0)
+        spd_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._speed_lbl = Gtk.Label()
+        self._speed_lbl.set_halign(Gtk.Align.START)
+        self._speed_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1.0, 1.0, 0.05)
+        self._speed_scale.set_draw_value(False)
+        init_speed = current.get("sensitivity", current.get("accel_speed", 0.0))
+        self._speed_scale.set_value(float(init_speed))
+        self._speed_lbl.set_text(f"Pointer Speed: {float(init_speed):.2f}")
+        self._speed_scale.connect("value-changed", lambda w: self._speed_lbl.set_text(
+            f"Pointer Speed: {w.get_value():.2f}"))
+        spd_box.pack_start(self._speed_lbl,   False, False, 0)
+        spd_box.pack_start(self._speed_scale, False, False, 0)
+        page.pack_start(spd_box, False, False, 0)
+
+        # ── Toggles ───────────────────────────────────────────────────────────
+        page.pack_start(self._section("Behaviour"), False, False, 0)
+
+        def _bool_val(key, aliases=(), default=False):
+            for k in (key,) + aliases:
+                v = current.get(k)
+                if v is not None:
+                    if isinstance(v, bool): return v
+                    return str(v).lower() in ("1","true","yes","enabled")
+            return default
+
+        toggles_cfg = [
+            ("_nat_scroll_sw", "Natural Scrolling", "󰑚",
+             _bool_val("natural_scroll")),
+            ("_tap_sw",        "Tap to Click",      "󱊈",
+             _bool_val("tap_button_map", ("tap",), False)),
+            ("_lefthanded_sw", "Left Handed",       "󰹆",
+             _bool_val("left_handed")),
+            ("_accel_sw",      "Adaptive Accel Profile", "󰣠",
+             _bool_val("accel_profile", default=False)),
+        ]
+        for attr, label, icon, init_val in toggles_cfg:
+            row = Gtk.Box(spacing=12); row.set_name("theme-row")
+            lbl = Gtk.Label(label=f"{icon}  {label}"); lbl.set_name("theme-text")
+            sw  = Gtk.Switch(); sw.set_active(bool(init_val))
+            row.pack_start(lbl, True,  True,  0)
+            row.pack_end(sw,    False, False, 10)
+            setattr(self, attr, sw)
+            page.pack_start(row, False, False, 0)
+
+        # ── Scroll speed (Hyprland / Sway support scroll_factor) ──────────────
+        page.pack_start(self._section("Scroll"), False, False, 0)
+        scr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._scroll_lbl = Gtk.Label(); self._scroll_lbl.set_halign(Gtk.Align.START)
+        self._scroll_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 5.0, 0.1)
+        self._scroll_scale.set_draw_value(False)
+        init_scroll = float(current.get("scroll_factor", current.get("scroll_speed", 1.0)))
+        self._scroll_scale.set_value(init_scroll)
+        self._scroll_lbl.set_text(f"Scroll Speed: {init_scroll:.1f}x")
+        self._scroll_scale.connect("value-changed", lambda w: self._scroll_lbl.set_text(
+            f"Scroll Speed: {w.get_value():.1f}x"))
+        scr_box.pack_start(self._scroll_lbl,   False, False, 0)
+        scr_box.pack_start(self._scroll_scale, False, False, 0)
+        page.pack_start(scr_box, False, False, 0)
+
+        # ── Apply ─────────────────────────────────────────────────────────────
+        apply_btn = Gtk.Button(label="󰆓 Apply & Save Input Settings")
+        apply_btn.set_name("btn-blue")
+        apply_btn.connect("clicked", self._apply_input)
+        page.pack_start(apply_btn, False, False, 8)
+
+        # Status label
+        self._input_status = Gtk.Label(label="")
+        self._input_status.set_name("mono-lbl")
+        self._input_status.set_halign(Gtk.Align.START)
+        page.pack_start(self._input_status, False, False, 0)
+
+        self._tab(page, "󰍽 Input")
+
+    def _read_input_config(self):
+        """Parse the compositor config and return current input settings as a flat dict."""
+        conf = WM.get_config_path()
+        if not conf or not os.path.exists(conf):
+            return {}
+        try:
+            with open(conf) as f: lines = f.readlines()
+        except: return {}
+
+        result = {}
+        if WM.name == "hyprland":
+            # Find input { } block and parse key = value lines inside it
+            in_block, depth = False, 0
+            for line in lines:
+                s = line.strip()
+                if re.match(r"^input\s*{", s):
+                    in_block, depth = True, 1; continue
+                if in_block:
+                    depth += s.count("{") - s.count("}")
+                    if depth <= 0: break
+                    if "=" in s and not s.startswith("#"):
+                        k, _, v = s.partition("=")
+                        result[k.strip()] = v.strip()
+
+        elif WM.name == "sway":
+            # input * { ... } or input "type:pointer" { ... }
+            in_block, depth = False, 0
+            for line in lines:
+                s = line.strip()
+                if re.match(r"^input\s+", s) and "{" in s:
+                    in_block, depth = True, s.count("{") - s.count("}"); continue
+                if in_block:
+                    depth += s.count("{") - s.count("}")
+                    if depth <= 0: break
+                    # sway: "natural_scroll enabled"
+                    parts = s.split()
+                    if len(parts) >= 2 and not s.startswith("#"):
+                        result[parts[0]] = parts[1]
+
+        elif WM.name in ("river", "mangowc"):
+            # riverctl input DEVICE prop VALUE
+            for line in lines:
+                s = line.strip()
+                m = re.match(r"riverctl input \S+ (\S+)\s+(\S+)", s)
+                if m: result[m.group(1).replace("-","_")] = m.group(2)
+
+        return result
+
+    def _apply_input(self, _b):
+        props = {
+            "sensitivity":    self._speed_scale.get_value(),
+            "natural_scroll": self._nat_scroll_sw.get_active(),
+            "tap_button_map": "lmr" if self._tap_sw.get_active() else "none",
+            "left_handed":    self._lefthanded_sw.get_active(),
+            "accel_profile":  "adaptive" if self._accel_sw.get_active() else "flat",
+            "scroll_factor":  self._scroll_scale.get_value(),
+        }
+
+        errors = []
+        written = False
+
+        # ── 1. Write to config file ───────────────────────────────────────────
+        conf = WM.get_config_path()
+        if CW and conf and os.path.exists(conf):
+            writer = CW.get_writer(WM.name, conf)
+            if writer:
+                try:
+                    if WM.name == "hyprland":
+                        # Map to hyprland input block keys
+                        hl = {
+                            "sensitivity":    f"{props['sensitivity']:.3f}",
+                            "natural_scroll": "true" if props["natural_scroll"] else "false",
+                            "left_handed":    "true" if props["left_handed"] else "false",
+                            "accel_profile":  props["accel_profile"],
+                            "scroll_factor":  f"{props['scroll_factor']:.2f}",
+                        }
+                        if self._tap_sw.get_active():
+                            hl["tap_button_map"] = "lmr"
+                        for k, v in hl.items():
+                            writer._set_nested("input", k, v)
+                        written = True
+
+                    elif WM.name in ("sway", "river"):
+                        sway_props = {
+                            "pointer_speed":  props["sensitivity"],
+                            "natural_scroll": props["natural_scroll"],
+                            "tap":            self._tap_sw.get_active(),
+                            "left_handed":    props["left_handed"],
+                        }
+                        writer.set_input("type:pointer", sway_props)
+                        written = True
+
+                except Exception as e:
+                    errors.append(f"Config write: {e}")
+
+        # ── 2. Apply live via IPC ─────────────────────────────────────────────
+        live_ok = False
+        try:
+            if WM.name == "hyprland":
+                ipc_map = {
+                    "sensitivity":   f"{props['sensitivity']:.3f}",
+                    "natural_scroll": "true" if props["natural_scroll"] else "false",
+                    "left_handed":    "true" if props["left_handed"] else "false",
+                    "accel_profile":  props["accel_profile"],
+                    "scroll_factor":  f"{props['scroll_factor']:.2f}",
+                }
+                if self._tap_sw.get_active():
+                    ipc_map["tap_button_map"] = "lmr"
+                for k, v in ipc_map.items():
+                    r = subprocess.run(
+                        ["hyprctl", "keyword", f"input:{k}", v],
+                        stderr=subprocess.DEVNULL)
+                    if r.returncode != 0:
+                        errors.append(f"hyprctl keyword input:{k} failed")
+                live_ok = not errors
+
+            elif WM.name == "sway":
+                sway_cmds = [
+                    f"input type:pointer accel_speed {props['sensitivity']:.3f}",
+                    f"input type:pointer natural_scroll {'enabled' if props['natural_scroll'] else 'disabled'}",
+                    f"input type:pointer left_handed {'enabled' if props['left_handed'] else 'disabled'}",
+                    f"input type:pointer tap {'enabled' if self._tap_sw.get_active() else 'disabled'}",
+                ]
+                for cmd in sway_cmds:
+                    r = subprocess.run(["swaymsg", cmd], stderr=subprocess.DEVNULL)
+                    if r.returncode != 0:
+                        errors.append(f"swaymsg failed: {cmd}")
+                live_ok = not errors
+        except Exception as e:
+            errors.append(f"IPC: {e}")
+
+        # ── Show result ───────────────────────────────────────────────────────
+        p = self._palette()
+        clr_ok   = p.get("green",  "#a6e3a1")
+        clr_warn = p.get("yellow", "#f9e2af")
+        clr_err  = p.get("red",    "#f38ba8")
+        if errors:
+            self._input_status.set_markup(
+                f"<span foreground='{clr_err}'>⚠  {'; '.join(errors)}</span>")
+        elif written and live_ok:
+            self._input_status.set_markup(
+                f"<span foreground='{clr_ok}'>✓  Saved to config and applied live.</span>")
+        elif written:
+            self._input_status.set_markup(
+                f"<span foreground='{clr_warn}'>✓  Saved to config. "
+                "Reload compositor to apply.</span>")
+        elif live_ok:
+            self._input_status.set_markup(
+                f"<span foreground='{clr_warn}'>✓  Applied live only "
+                "(config not found — changes lost on restart).</span>")
+        else:
+            self._input_status.set_markup(
+                f"<span foreground='{clr_err}'>⚠  No config found and IPC unavailable "
+                f"for {WM.name}.</span>")
+
+        # ── Clock & Timezone tab ──────────────────────────────────────────────────
+    def _build_clock_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        # Live clock
+        page.pack_start(self._section("Current Time"), False, False, 0)
+        self._clock_lbl = Gtk.Label(); self._clock_lbl.set_name("big-clock")
+        self._clock_lbl.set_halign(Gtk.Align.START)
+        page.pack_start(self._clock_lbl, False, False, 0)
+        self._update_clock()
+        GLib.timeout_add(1000, self._update_clock)
+
+        # NTP toggle
+        ntp_row = Gtk.Box(spacing=12); ntp_row.set_name("theme-row")
+        ntp_lbl = Gtk.Label(label="󰅐  Network Time (NTP)"); ntp_lbl.set_name("theme-text")
+        self._ntp_sw = Gtk.Switch()
+        ntp_active = "yes" in _run("timedatectl","show","--property=NTP","--value",fallback="no").lower()
+        self._ntp_sw.set_active(ntp_active)
+        self._ntp_sw.connect("notify::active", self._on_ntp_toggle)
+        ntp_row.pack_start(ntp_lbl,    True,  True,  0)
+        ntp_row.pack_end(self._ntp_sw, False, False, 10)
+        page.pack_start(ntp_row, False, False, 0)
+
+        # Timezone search + list
+        page.pack_start(self._section("Timezone"), False, False, 0)
+        self._tz_search = Gtk.SearchEntry()
+        self._tz_search.set_placeholder_text("Filter timezones…")
+        self._tz_search.connect("search-changed", self._filter_tz)
+        page.pack_start(self._tz_search, False, False, 0)
+
+        tz_scroll = Gtk.ScrolledWindow()
+        tz_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        tz_scroll.set_min_content_height(260)
+        self._tz_store = Gtk.ListStore(str)
+        self._tz_view  = Gtk.TreeView(model=self._tz_store)
+        self._tz_view.set_headers_visible(False); self._tz_view.set_name("font-tree")
+        self._tz_view.append_column(Gtk.TreeViewColumn("TZ", Gtk.CellRendererText(), text=0))
+        self._tz_view.get_selection().connect("changed", self._on_tz_select)
+        tz_scroll.add(self._tz_view)
+        page.pack_start(tz_scroll, True, True, 0)
+
+        self._tab(page, "󰥔 Clock")
+        GLib.idle_add(self._load_timezones)
+
+    def _update_clock(self):
+        import datetime
+        now = datetime.datetime.now()
+        tz  = _run("timedatectl","show","--property=Timezone","--value",fallback="?")
+        p = self._palette()
+        self._clock_lbl.set_markup(
+            f"<span size='xx-large' weight='bold'>{now.strftime('%H:%M:%S')}</span>\n"
+            f"<span size='medium' foreground='{p["subtext"]}'>{now.strftime('%A, %d %B %Y')}  ·  {tz}</span>")
+        return True
+
+    def _on_ntp_toggle(self, sw, _p):
+        subprocess.run(["timedatectl","set-ntp","1" if sw.get_active() else "0"],
+                       stderr=subprocess.DEVNULL)
+
+    def _load_timezones(self):
+        self._tz_store.clear()
+        self._all_tz = _run("timedatectl","list-timezones").splitlines()
+        for tz in self._all_tz: self._tz_store.append([tz])
+        # pre-select current
+        cur = _run("timedatectl","show","--property=Timezone","--value",fallback="")
+        for i, tz in enumerate(self._all_tz):
+            if tz == cur:
+                self._tz_view.set_cursor(Gtk.TreePath(i),None,False)
+                break
+        return False
+
+    def _filter_tz(self, entry):
+        q = entry.get_text().lower()
+        self._tz_store.clear()
+        for tz in getattr(self,"_all_tz",[]):
+            if q in tz.lower(): self._tz_store.append([tz])
+
+    def _on_tz_select(self, sel):
+        model, it = sel.get_selected()
+        if not it: return
+        tz = model[it][0]
+        ret = subprocess.run(["timedatectl","set-timezone",tz],
+                             stderr=subprocess.DEVNULL)
+        if ret.returncode == 0: self._update_clock()
+
+    # ── Keybinds tab ─────────────────────────────────────────────────────────
+    def _build_keybinds_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        conf = WM.get_config_path()
+
+        if not conf:
+            page.pack_start(Gtk.Label(
+                label=f"No config found for {WM.name}"), False, False, 20)
+            self._tab(page, "󰌌 Keybinds"); return
+
+        page.pack_start(self._section(f"Keybinds — {WM.name}"), False, False, 0)
+        info = Gtk.Label(label=conf); info.set_name("mono-lbl")
+        info.set_halign(Gtk.Align.START); page.pack_start(info, False, False, 0)
+
+        note_map = {
+            "niri":  "Niri uses KDL — direct line editing not supported. Edit the file manually.",
+            "labwc": "Labwc uses XML — direct editing not supported. Edit rc.xml manually.",
+        }
+        if WM.name in note_map:
+            page.pack_start(Gtk.Label(label=note_map[WM.name]), False, False, 4)
+            open_btn = Gtk.Button(label=f"Open {conf}")
+            open_btn.connect("clicked", lambda w: subprocess.Popen(
+                ["xdg-open", conf], stderr=subprocess.DEVNULL))
+            page.pack_start(open_btn, False, False, 0)
+            self._tab(page, "󰌌 Keybinds"); return
+
+        self._kb_search = Gtk.SearchEntry()
+        self._kb_search.set_placeholder_text("Filter…")
+        self._kb_search.connect("search-changed", self._filter_kb)
+        page.pack_start(self._kb_search, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(320)
+        self._kb_store = Gtk.ListStore(str, str, str)
+        self._kb_view  = Gtk.TreeView(model=self._kb_store)
+        self._kb_view.set_name("kb-tree")
+        for i, title in enumerate(["Modifier", "Key", "Command"]):
+            r = Gtk.CellRendererText(); r.set_property("editable", True)
+            r.connect("edited", lambda _r, path, txt, col=i: (
+                self._kb_store.__setitem__(path, list(self._kb_store[path][:col])
+                                          + [txt] + list(self._kb_store[path][col+1:])),))
+            self._kb_view.append_column(Gtk.TreeViewColumn(title, r, text=i))
+        scroll.add(self._kb_view)
+        page.pack_start(scroll, True, True, 0)
+
+        btns = Gtk.Box(spacing=10)
+        add_btn = Gtk.Button(label="+ Add")
+        add_btn.connect("clicked", lambda w: self._kb_store.append(["SUPER","Return","exec, kitty"]))
+        del_btn = Gtk.Button(label="󰆴 Remove"); del_btn.set_name("btn-red")
+        del_btn.connect("clicked", self._del_keybind)
+        save_btn = Gtk.Button(label="󰆓 Save"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", lambda w: self._save_keybinds(conf))
+        reload_btn = Gtk.Button(label="󰑓 Reload"); reload_btn.set_name("btn-blue")
+        reload_btn.connect("clicked", lambda w: WM.reload_config())
+        btns.pack_start(add_btn,    False, False, 0)
+        btns.pack_start(del_btn,    False, False, 0)
+        btns.pack_end(reload_btn,   False, False, 0)
+        btns.pack_end(save_btn,     False, False, 0)
+        page.pack_start(btns, False, False, 0)
+
+        self._tab(page, "󰌌 Keybinds")
+        GLib.idle_add(lambda: (self._load_keybinds(conf), False))
+
+    def _load_keybinds(self, path):
+        self._kb_store.clear(); self._kb_conf = path
+        try:
+            with open(path) as f: lines = f.readlines()
+        except: return
+        self._kb_other = []
+        for line in lines:
+            parsed = WM.parse_keybinds([line])
+            if parsed:
+                self._kb_store.append(list(parsed[0]))
+            else:
+                self._kb_other.append(line)
+
+    def _filter_kb(self, entry):
+        q = entry.get_text().lower()
+        # simple: reload and filter
+        if not hasattr(self, "_kb_conf"): return
+        try:
+            with open(self._kb_conf) as f: lines = f.readlines()
+        except: return
+        self._kb_store.clear()
+        for mod, key, cmd in WM.parse_keybinds(lines):
+            if q in f"{mod} {key} {cmd}".lower():
+                self._kb_store.append([mod, key, cmd])
+
+    def _del_keybind(self, _w):
+        sel = self._kb_view.get_selection()
+        model, it = sel.get_selected()
+        if it: model.remove(it)
+
+    def _save_keybinds(self, path):
+        try:
+            import shutil as _sh; _sh.copy2(path, path+".bak")
+            with open(path,"w") as f:
+                f.writelines(self._kb_other)
+                for row in self._kb_store:
+                    f.write(WM.format_keybind(row[0],row[1],row[2]) + "\n")
+            self._msg(f"Saved to {path}\n(backup: {path}.bak)")
+        except Exception as e:
+            self._msg(str(e), Gtk.MessageType.ERROR)
+
+    # ── Fonts tab ─────────────────────────────────────────────────────────────
+    def _build_fonts_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        if not _has("fc-list"):
+            page.pack_start(Gtk.Label(label="fc-list not found — install fontconfig"),
+                            False, False, 20)
+            self._tab(page, "󰛖 Fonts"); return
+
+        self._font_search = Gtk.SearchEntry()
+        self._font_search.set_placeholder_text("Filter fonts…")
+        self._font_search.connect("search-changed", self._filter_fonts)
+        page.pack_start(self._font_search, False, False, 0)
+
+        split = Gtk.Box(spacing=14)
+        font_scroll = Gtk.ScrolledWindow()
+        font_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        font_scroll.set_min_content_height(340); font_scroll.set_size_request(280,-1)
+        self._font_store = Gtk.ListStore(str)
+        self._font_tree  = Gtk.TreeView(model=self._font_store)
+        self._font_tree.set_headers_visible(False); self._font_tree.set_name("font-tree")
+        self._font_tree.append_column(Gtk.TreeViewColumn("Font",Gtk.CellRendererText(),text=0))
+        self._font_tree.get_selection().connect("changed", self._on_font_select)
+        font_scroll.add(self._font_tree)
+        split.pack_start(font_scroll, False, False, 0)
+
+        pv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        pv_box.set_hexpand(True)
+        pv_box.pack_start(self._section("Preview"), False, False, 0)
+        self._font_preview = Gtk.Label(
+            label="The quick brown fox\njumps over the lazy dog\n0123456789 !@#$")
+        self._font_preview.set_name("font-preview"); self._font_preview.set_halign(Gtk.Align.START)
+        self._font_preview.set_line_wrap(True)
+        pv_box.pack_start(self._font_preview, False, False, 0)
+        pv_box.pack_start(self._section("Size"), False, False, 6)
+        self._font_size = Gtk.SpinButton.new_with_range(8, 72, 1)
+        self._font_size.set_value(14)
+        self._font_size.connect("value-changed", self._update_font_preview)
+        pv_box.pack_start(self._font_size, False, False, 0)
+        save_btn = Gtk.Button(label="󰆓 Save as Interface Font")
+        save_btn.connect("clicked", self._save_font)
+        pv_box.pack_end(save_btn, False, False, 0)
+        split.pack_start(pv_box, True, True, 0)
+        page.pack_start(split, True, True, 0)
+
+        self._tab(page, "󰛖 Fonts")
+        GLib.idle_add(self._load_fonts)
+
+    def _load_fonts(self):
+        self._font_store.clear()
+        self._all_fonts = sorted(set(
+            l.split(":")[0].strip()
+            for l in _run("fc-list").splitlines() if ":" in l))
+        for f in self._all_fonts: self._font_store.append([f])
+        return False
+
+    def _filter_fonts(self, e):
+        q = e.get_text().lower()
+        self._font_store.clear()
+        for f in getattr(self,"_all_fonts",[]):
+            if q in f.lower(): self._font_store.append([f])
+
+    def _on_font_select(self, sel):
+        model, it = sel.get_selected()
+        if it: self._sel_font = model[it][0]; self._update_font_preview(None)
+
+    def _update_font_preview(self, _w):
+        font = getattr(self,"_sel_font","Sans")
+        size = int(self._font_size.get_value())
+        self._font_preview.override_font(Pango.FontDescription.from_string(f"{font} {size}"))
+
+    def _save_font(self, _w):
+        font = getattr(self,"_sel_font",None)
+        if not font: return
+        data = {}
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: pass
+        data["font"] = font
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+        self._msg(f"Saved '{font}' as interface font.\nRestart the bar to apply.")
+
+    # ── Default Apps tab ──────────────────────────────────────────────────────
+    def _build_defaults_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        if not _has("xdg-mime"):
+            page.pack_start(Gtk.Label(label="xdg-mime not found — install xdg-utils"),
+                            False, False, 20)
+            self._tab(page, "󰏔 Defaults"); return
+
+        page.pack_start(self._section("Default Applications"), False, False, 0)
+        common = [
+            ("Web Browser",     "x-scheme-handler/http"),
+            ("File Manager",    "inode/directory"),
+            ("Text Editor",     "text/plain"),
+            ("Image Viewer",    "image/png"),
+            ("Video Player",    "video/mp4"),
+            ("Music Player",    "audio/mpeg"),
+            ("PDF Viewer",      "application/pdf"),
+            ("Email Client",    "x-scheme-handler/mailto"),
+            ("Archive Manager", "application/zip"),
+            ("Terminal",        "x-scheme-handler/terminal"),
+        ]
+        grid = Gtk.Grid(); grid.set_row_spacing(10); grid.set_column_spacing(14)
+        self._mime_entries = {}
+        for i, (label, mime) in enumerate(common):
+            lbl = Gtk.Label(label=label); lbl.set_halign(Gtk.Align.START)
+            lbl.set_name("mime-lbl")
+            cur = _run("xdg-mime","query","default",mime).replace(".desktop","") or "—"
+            ent = Gtk.Entry(); ent.set_text(cur)
+            ent.set_placeholder_text("app.desktop"); ent.set_width_chars(24)
+            ent.set_name("mime-entry")
+            btn = Gtk.Button(label="Apply"); btn.set_name("small-btn")
+            btn.connect("clicked", lambda w, m=mime, e=ent: self._set_default(m, e.get_text()))
+            self._mime_entries[mime] = ent
+            grid.attach(lbl, 0, i, 1, 1)
+            grid.attach(ent, 1, i, 1, 1)
+            grid.attach(btn, 2, i, 1, 1)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(360); scroll.add(grid)
+        page.pack_start(scroll, True, True, 0)
+
+        page.pack_start(self._section("Custom MIME"), False, False, 0)
+        custom = Gtk.Box(spacing=10)
+        self._custom_mime = Gtk.Entry(); self._custom_mime.set_placeholder_text("mime/type")
+        self._custom_app  = Gtk.Entry(); self._custom_app.set_placeholder_text("app.desktop")
+        cb = Gtk.Button(label="Set"); cb.set_name("small-btn")
+        cb.connect("clicked", lambda w: self._set_default(
+            self._custom_mime.get_text(), self._custom_app.get_text()))
+        custom.pack_start(self._custom_mime, True, True, 0)
+        custom.pack_start(self._custom_app,  True, True, 0)
+        custom.pack_start(cb,                False, False, 0)
+        page.pack_start(custom, False, False, 0)
+        self._tab(page, "󰏔 Defaults")
+
+    def _set_default(self, mime, app):
+        if not mime or not app: return
+        if not app.endswith(".desktop"): app += ".desktop"
+        subprocess.run(["xdg-mime","default",app,mime], stderr=subprocess.DEVNULL)
+
+    # ── Plugins tab ───────────────────────────────────────────────────────────
+    def _build_plugins_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        if not WM.supports_plugins():
+            page.pack_start(self._section("Plugin Support"), False, False, 0)
+            msg = {
+                "hyprland": "hyprpm not found — install it from the Hyprland repo.",
+                "sway":     "Sway does not have a plugin system.",
+                "niri":     "Niri does not have a plugin system yet.",
+            }.get(WM.name, f"{WM.name} does not support plugins via Essentials.")
+            lbl = Gtk.Label(label=msg); lbl.set_halign(Gtk.Align.START)
+            lbl.set_name("mono-lbl"); page.pack_start(lbl, False, False, 0)
+
+            # Still show a config script editor for river/labwc/mangowc
+            if WM.name in ("river","labwc","mangowc"):
+                page.pack_start(self._section("Custom Init Script"), False, False, 8)
+                conf = WM.get_config_path()
+                if conf:
+                    scroll = Gtk.ScrolledWindow()
+                    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+                    scroll.set_min_content_height(320)
+                    buf = Gtk.TextBuffer()
+                    try:
+                        with open(conf) as f: buf.set_text(f.read())
+                    except: buf.set_text(f"# Could not read {conf}")
+                    tv = Gtk.TextView(buffer=buf); tv.set_name("kb-tree")
+                    tv.set_monospace(True); tv.set_wrap_mode(Gtk.WrapMode.NONE)
+                    scroll.add(tv)
+                    page.pack_start(scroll, True, True, 0)
+                    save_btn = Gtk.Button(label=f"󰆓 Save {conf}"); save_btn.set_name("btn-blue")
+                    save_btn.connect("clicked", lambda w, b=buf, p=conf: (
+                        open(p,"w").write(b.get_text(b.get_start_iter(),b.get_end_iter(),False)),
+                        WM.reload_config()))
+                    page.pack_start(save_btn, False, False, 0)
+            self._tab(page, "󰏗 Plugins"); return
+
+        # Hyprland hyprpm UI
+        top = Gtk.Box(spacing=10)
+        top.pack_start(self._section("Installed Plugins"), False, False, 0)
+        refresh_btn = Gtk.Button(label="󰑓 Refresh"); refresh_btn.set_name("small-btn")
+        refresh_btn.connect("clicked", lambda w: self._refresh_plugins())
+        top.pack_end(refresh_btn, False, False, 0)
+        page.pack_start(top, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(240)
+        self._plugin_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        scroll.add(self._plugin_box)
+        page.pack_start(scroll, True, True, 0)
+
+        # Add repo
+        page.pack_start(self._section("Add Plugin Repository"), False, False, 0)
+        add_row = Gtk.Box(spacing=10)
+        self._plugin_url = Gtk.Entry()
+        self._plugin_url.set_placeholder_text("https://github.com/user/hyprplugin")
+        add_btn = Gtk.Button(label="Add Repo"); add_btn.set_name("btn-blue")
+        add_btn.connect("clicked", lambda w: (
+            WM.add_plugin_repo(self._plugin_url.get_text()),
+            GLib.timeout_add(2000, lambda: (self._refresh_plugins(), False))))
+        add_row.pack_start(self._plugin_url, True,  True,  0)
+        add_row.pack_start(add_btn,          False, False, 0)
+        page.pack_start(add_row, False, False, 0)
+
+        self._tab(page, "󰏗 Plugins")
+        GLib.idle_add(self._refresh_plugins)
+
+    def _refresh_plugins(self):
+        for c in self._plugin_box.get_children(): self._plugin_box.remove(c)
+        plugins = WM.get_plugins()
+        if not plugins:
+            self._plugin_box.pack_start(
+                Gtk.Label(label="No plugins installed — add a repo above"),
+                False, False, 0)
+        for p in plugins:
+            row = Gtk.Box(spacing=12); row.set_name("net-row")
+            _sub = self._palette()["subtext"]
+            lbl = Gtk.Label()
+            lbl.set_markup(f"{'󰄴' if p['enabled'] else '󰄰'}  {p['name']}  "
+                           f"<span size='small' foreground='{_sub}'>{p['version']}</span>")
+            lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
+            toggle_btn = Gtk.Button(
+                label="Disable" if p["enabled"] else "Enable")
+            toggle_btn.set_name("small-btn-accent" if p["enabled"] else "small-btn")
+            toggle_btn.connect("clicked", lambda w, name=p["name"], en=p["enabled"]: (
+                WM.plugin_action(name, "disable" if en else "enable"),
+                GLib.timeout_add(1500, lambda: (self._refresh_plugins(), False))))
+            rm_btn = Gtk.Button(label="Remove"); rm_btn.set_name("btn-red")
+            rm_btn.connect("clicked", lambda w, name=p["name"]: (
+                WM.plugin_action(name, "remove"),
+                GLib.timeout_add(1500, lambda: (self._refresh_plugins(), False))))
+            row.pack_start(lbl,        True,  True,  0)
+            row.pack_start(toggle_btn, False, False, 0)
+            row.pack_start(rm_btn,     False, False, 0)
+            self._plugin_box.pack_start(row, False, False, 0)
+        self._plugin_box.show_all()
+        return False
+
+    # ── Bar Layout tab ───────────────────────────────────────────────────────────
+    def _build_layout_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        # ── Style picker ──────────────────────────────────────────────────────
+        page.pack_start(self._section("Bar Style"), False, False, 0)
+
+        STYLES = {
+            "trilands": ("Trilands",  "Three separate rounded pills — default"),
+            "islands":  ("Islands",   "Compact distinct floating islands"),
+            "still":    ("Still",     "Classic full-width anchored bar"),
+            "floating": ("Floating",  "Single centered floating bar"),
+            "blocks":   ("Blocks",    "Rectangular blocks with thick border"),
+        }
+
+        style_box = Gtk.Box(spacing=8)
+        self._style_btns = {}
+
+        # Load current
+        try:
+            with open(CONFIG_PATH) as f: _cfg = json.load(f)
+        except: _cfg = {}
+        current_style = _cfg.get("bar_style", "trilands")
+
+        for sid, (label, tooltip) in STYLES.items():
+            btn = Gtk.ToggleButton(label=label)
+            btn.set_name("style-btn-active" if sid == current_style else "style-btn")
+            btn.set_tooltip_text(tooltip)
+            btn.set_active(sid == current_style)
+            btn.connect("clicked", self._on_style_select, sid)
+            self._style_btns[sid] = btn
+            style_box.pack_start(btn, True, True, 0)
+
+        page.pack_start(style_box, False, False, 0)
+        page.pack_start(Gtk.Separator(), False, False, 4)
+
+        desc = Gtk.Label(label="Reorder widgets with ↑↓, add/remove with the buttons, then Save and Restart Bar.")
+        desc.set_halign(Gtk.Align.START); desc.set_name("mono-lbl")
+        desc.set_line_wrap(True)
+        page.pack_start(desc, False, False, 0)
+
+        # Load current layout
+        if CW:
+            self._bar_layout = CW.load_bar_layout()
+        else:
+            self._bar_layout = {
+                "left":   ["launcher","wm-badge","workspaces"],
+                "center": ["media","clock"],
+                "right":  ["network","cpu","ram","cc-button"],
+            }
+
+        ALL_WIDGETS = {
+            "launcher":"󰣇  Launcher","wm-badge":"󰖲  WM Badge",
+            "workspaces":"󰮯  Workspaces","clock":"󰥔  Clock",
+            "media":"󰝚  Media","cpu":"󰍛  CPU","ram":"󰘚  RAM",
+            "network":"󰖩  Network","temp":"󰔏  Temp","disk":"󰋊  Disk",
+            "battery":"󰁹  Battery","updates":"󰚰  Updates",
+            "cc-button":"󰒓  CC Button","power-button":"󰐥  Power",
+            "separator":"│  Separator",
+        }
+
+        # Three columns
+        cols_box = Gtk.Box(spacing=14, homogeneous=True)
+
+        self._section_stores = {}
+        self._section_views  = {}
+
+        for section in ("left","center","right"):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            col.pack_start(self._section(f"{section.capitalize()} Section"), False, False, 0)
+
+            store = Gtk.ListStore(str, str)   # id, display label
+            for wid in self._bar_layout.get(section, []):
+                label = ALL_WIDGETS.get(wid, wid)
+                store.append([wid, label])
+            self._section_stores[section] = store
+
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_min_content_height(260)
+            tv = Gtk.TreeView(model=store); tv.set_name("kb-tree")
+            tv.set_headers_visible(False)
+            tv.set_reorderable(True)
+            tv.append_column(Gtk.TreeViewColumn("Widget", Gtk.CellRendererText(), text=1))
+            self._section_views[section] = tv
+            scroll.add(tv); col.pack_start(scroll, True, True, 0)
+
+            # Add / Remove buttons
+            btn_row = Gtk.Box(spacing=6)
+            add_btn = Gtk.Button(label="+ Add"); add_btn.set_name("small-btn")
+            add_btn.connect("clicked", lambda w, s=section, st=store, aw=ALL_WIDGETS:
+                self._add_widget_dialog(s, st, aw))
+            rem_btn = Gtk.Button(label="󰆴 Remove"); rem_btn.set_name("btn-red")
+            rem_btn.connect("clicked", lambda w, tv=tv, st=store: self._remove_widget(tv, st))
+            up_btn  = Gtk.Button(label="↑"); up_btn.set_name("small-btn")
+            up_btn.connect("clicked",  lambda w, tv=tv, st=store: self._move_widget(tv, st, -1))
+            dn_btn  = Gtk.Button(label="↓"); dn_btn.set_name("small-btn")
+            dn_btn.connect("clicked",  lambda w, tv=tv, st=store: self._move_widget(tv, st,  1))
+            btn_row.pack_start(add_btn, False, False, 0)
+            btn_row.pack_start(rem_btn, False, False, 0)
+            btn_row.pack_end(dn_btn,    False, False, 0)
+            btn_row.pack_end(up_btn,    False, False, 0)
+            col.pack_start(btn_row, False, False, 0)
+            cols_box.pack_start(col, True, True, 0)
+
+        page.pack_start(cols_box, True, True, 0)
+
+        # Save + Reset row
+        action_row = Gtk.Box(spacing=10)
+        save_btn  = Gtk.Button(label="󰆓 Save Layout"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", self._save_layout)
+        reset_btn = Gtk.Button(label="Reset to Default")
+        reset_btn.connect("clicked", self._reset_layout)
+        restart_btn = Gtk.Button(label="󰑓 Restart Bar"); restart_btn.set_name("btn-blue")
+        restart_btn.connect("clicked", lambda w: subprocess.run(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-theme-apply")]))
+        action_row.pack_start(save_btn,    False, False, 0)
+        action_row.pack_start(reset_btn,   False, False, 0)
+        action_row.pack_end(restart_btn,   False, False, 0)
+        page.pack_start(action_row, False, False, 0)
+
+        self._layout_all_widgets = ALL_WIDGETS
+        self._tab(page, "󰕰 Bar Layout")
+
+    def _on_style_select(self, btn, style_id):
+        # Guard against re-entrancy — set_active() on other buttons
+        # would re-fire this signal and recurse infinitely.
+        if getattr(self, "_style_lock", False):
+            return
+        if not btn.get_active():
+            # User clicked the already-active button — keep it on
+            self._style_lock = True
+            btn.set_active(True)
+            self._style_lock = False
+            return
+        self._style_lock = True
+        for sid, b in self._style_btns.items():
+            b.set_active(sid == style_id)
+            b.set_name("style-btn-active" if sid == style_id else "style-btn")
+        self._style_lock = False
+        # Persist
+        data = {}
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: pass
+        data["bar_style"] = style_id
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f: json.dump(data, f, indent=4)
+
+    def _add_widget_dialog(self, section, store, all_widgets):
+        dlg = Gtk.Dialog(title="Add Widget", parent=self, flags=Gtk.DialogFlags.MODAL)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        c = dlg.get_content_area()
+        c.set_margin_start(16); c.set_margin_end(16)
+        c.set_margin_top(12);   c.set_margin_bottom(12)
+        c.pack_start(Gtk.Label(label="Choose a widget:"), False, False, 4)
+        combo = Gtk.ComboBoxText()
+        for wid, lbl in all_widgets.items():
+            combo.append(wid, lbl)
+        combo.set_active(0)
+        c.pack_start(combo, False, False, 4)
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            wid = combo.get_active_id()
+            if wid: store.append([wid, all_widgets[wid]])
+        dlg.destroy()
+
+    def _remove_widget(self, tv, store):
+        sel = tv.get_selection()
+        model, it = sel.get_selected()
+        if it: store.remove(it)
+
+    def _move_widget(self, tv, store, direction):
+        sel = tv.get_selection()
+        model, it = sel.get_selected()
+        if not it: return
+        path = model.get_path(it)
+        idx  = path.get_indices()[0]
+        target = idx + direction
+        if target < 0 or target >= len(store): return
+        store.swap(store.get_iter(Gtk.TreePath(idx)),
+                   store.get_iter(Gtk.TreePath(target)))
+        tv.get_selection().select_path(Gtk.TreePath(target))
+
+    def _save_layout(self, _w=None):
+        layout = {}
+        for section, store in self._section_stores.items():
+            layout[section] = [row[0] for row in store]
+        if CW:
+            CW.save_bar_layout(layout)
+            self._msg("Bar layout saved. Click Restart Bar to apply.")
+        else:
+            self._msg("config-writer not found — could not save layout.",
+                      Gtk.MessageType.ERROR)
+
+    def _reset_layout(self, _w=None):
+        defaults = {
+            "left":   ["launcher","wm-badge","workspaces"],
+            "center": ["media","clock"],
+            "right":  ["network","cpu","ram","cc-button"],
+        }
+        for section, store in self._section_stores.items():
+            store.clear()
+            for wid in defaults.get(section, []):
+                label = self._layout_all_widgets.get(wid, wid)
+                store.append([wid, label])
+
+    # ── Key handler ───────────────────────────────────────────────────────────────
+    # ── Wallpaper tab ──────────────────────────────────────────────────────────
+    def _build_wallpaper_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.pack_start(self._section("Wallpaper Manager"), False, False, 0)
+
+        current = _run("cat", os.path.expanduser("~/.config/essentials/config.json"),
+                       fallback="")
+        wall_path = ""
+        try:
+            wall_path = json.loads(current).get("wallpaper","")
+        except: pass
+
+        cur_lbl = Gtk.Label(label=f"Current: {wall_path or 'Not set'}")
+        cur_lbl.set_name("mono-lbl"); cur_lbl.set_halign(Gtk.Align.START)
+        cur_lbl.set_ellipsize(3)
+        page.pack_start(cur_lbl, False, False, 0)
+
+        btns = Gtk.Box(spacing=10)
+        open_btn  = Gtk.Button(label="󰋩 Open Wallpaper Manager")
+        open_btn.set_name("btn-blue")
+        open_btn.connect("clicked", lambda _: subprocess.Popen(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-wallpaper")]))
+        restore_btn = Gtk.Button(label="󰑓 Restore Current Wallpaper")
+        restore_btn.connect("clicked", self._restore_wallpaper)
+        btns.pack_start(open_btn,    False, False, 0)
+        btns.pack_start(restore_btn, False, False, 0)
+        page.pack_start(btns, False, False, 0)
+
+        # Wallpaper tools status
+        page.pack_start(self._section("Available Setters"), False, False, 0)
+        import shutil as _shutil
+        for tool, desc in [
+            ("swww",      "swww — animated transitions"),
+            ("swaybg",    "swaybg — simple and reliable"),
+            ("hyprpaper", "hyprpaper — Hyprland native"),
+            ("feh",       "feh — X11 / XWayland fallback"),
+        ]:
+            found = _shutil.which(tool) is not None
+            row = Gtk.Box(spacing=10)
+            icon = Gtk.Label()
+            _pc = self._palette()
+            icon.set_markup(f"<span foreground='{ _pc.get('green','#a6e3a1') if found else _pc.get('red','#f38ba8') }'>{'✓' if found else '✗'}</span>")
+            lbl = Gtk.Label(label=desc); lbl.set_halign(Gtk.Align.START)
+            row.pack_start(icon, False, False, 0)
+            row.pack_start(lbl,  False, False, 0)
+            page.pack_start(row, False, False, 0)
+
+        self._tab(page, "󰋩 Wallpaper")
+
+    def _restore_wallpaper(self, _):
+        subprocess.Popen(
+            ["python3", "-c",
+             "import importlib.util, os; "
+             "spec=importlib.util.spec_from_file_location('w',"
+             "os.path.expanduser('~/.local/bin/essentials-wallpaper')); "
+             "mod=importlib.util.module_from_spec(spec); "
+             "spec.loader.exec_module(mod); "
+             "mod.restore_wallpaper()"],
+            stderr=subprocess.DEVNULL)
+
+    # ── Widgets config tab ──────────────────────────────────────────────────────
+    def _build_widgets_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.pack_start(self._section("Desktop Widgets"), False, False, 0)
+
+        desc = Gtk.Label(label="Widgets render on the desktop background layer. Enable/disable and position each widget below.")
+        desc.set_name("mono-lbl"); desc.set_halign(Gtk.Align.START)
+        desc.set_line_wrap(True); page.pack_start(desc, False, False, 0)
+
+        try:
+            with open(CONFIG_PATH) as f: cfg = json.load(f)
+        except: cfg = {}
+        wcfg = cfg.get("widgets", {})
+        enabled = set(wcfg.get("enabled", []))
+
+        self._widget_switches = {}
+        CORNERS = ["top-left","top-right","bottom-left","bottom-right","center"]
+
+        for wname, wdesc, default_corner in [
+            ("clock",   "Large clock with date",          "top-left"),
+            ("sysinfo", "CPU / RAM / disk / temp",        "bottom-left"),
+            ("media",   "Now playing with controls",      "bottom-right"),
+        ]:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            row.set_name("theme-row")
+            top_row = Gtk.Box(spacing=12)
+
+            sw = Gtk.Switch(); sw.set_active(wname in enabled)
+            lbl = Gtk.Label(label=f"{wname.capitalize()} — {wdesc}")
+            lbl.set_name("theme-text"); lbl.set_halign(Gtk.Align.START)
+            top_row.pack_start(lbl, True,  True,  0)
+            top_row.pack_end(sw,    False, False, 10)
+            row.pack_start(top_row, False, False, 0)
+
+            # Corner picker — track first RadioButton explicitly for group
+            corner_box  = Gtk.Box(spacing=6)
+            cur_corner  = wcfg.get(wname,{}).get("corner", default_corner)
+            first_rb    = None
+            for corner in CORNERS:
+                cb = Gtk.RadioButton.new_with_label_from_widget(first_rb, corner)
+                if first_rb is None:
+                    first_rb = cb
+                cb.set_active(corner == cur_corner)
+                cb.connect("toggled", self._on_widget_corner, wname, corner)
+                corner_box.pack_start(cb, False, False, 0)
+            row.pack_start(corner_box, False, False, 0)
+            page.pack_start(row, False, False, 0)
+            self._widget_switches[wname] = sw
+
+        btns = Gtk.Box(spacing=10)
+        save_btn  = Gtk.Button(label="󰆓 Save Widget Config"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", self._save_widget_config)
+        start_btn = Gtk.Button(label="▶ Start Widgets")
+        start_btn.connect("clicked", lambda _: subprocess.Popen(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-widgets")]))
+        stop_btn  = Gtk.Button(label="■ Stop Widgets"); stop_btn.set_name("btn-red")
+        stop_btn.connect("clicked", lambda _: subprocess.run(
+            ["pkill","-f","essentials-widgets"], stderr=subprocess.DEVNULL))
+        btns.pack_start(save_btn,  False, False, 0)
+        btns.pack_start(start_btn, False, False, 0)
+        btns.pack_start(stop_btn,  False, False, 0)
+        page.pack_start(btns, False, False, 0)
+
+        self._tab(page, "󱇛 Widgets")
+
+    def _on_widget_corner(self, rb, wname, corner):
+        if not rb.get_active(): return
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        if "widgets" not in data: data["widgets"] = {}
+        if wname not in data["widgets"]: data["widgets"][wname] = {}
+        data["widgets"][wname]["corner"] = corner
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+    def _save_widget_config(self, _):
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        if "widgets" not in data: data["widgets"] = {}
+        data["widgets"]["enabled"] = [
+            name for name, sw in self._widget_switches.items() if sw.get_active()
+        ]
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+        self._msg("Widget config saved. Restart widgets to apply.")
+
+    def on_key_press(self, w, e):
+        if e.keyval == Gdk.KEY_Escape: Gtk.main_quit()
+
+
+    def _palette(self):
+        """
+        Build the full colour palette from the active theme in themes.json.
+        The theme supplies bg, accent, text (and optionally more).
+        Everything else is derived algorithmically so ANY theme works.
+        """
+        import colorsys, re as _re
+
+        # ── Load active theme ─────────────────────────────────────────────────
+        try:
+            data  = json.load(open(THEME_PATH))
+            tname = data.get("current", "catppuccin")
+            t     = data.get(tname, data.get("catppuccin", {}))
+        except Exception:
+            t = {}
+
+        raw_bg     = t.get("bg",     "rgba(17,17,27,0.92)")
+        raw_accent = t.get("accent", "#cba6f7").lstrip("#")
+        raw_text   = t.get("text",   "#cdd6f4").lstrip("#")
+
+        # ── Parse accent hex → RGB ────────────────────────────────────────────
+        def _parse_hex(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
+        def _hex(r, g, b):
+            return "{:02x}{:02x}{:02x}".format(
+                int(r*255), int(g*255), int(b*255))
+
+        def _shift(h6, sat_mul=1.0, val_mul=1.0):
+            r, g, b = _parse_hex(h6)
+            hh, s, v = colorsys.rgb_to_hsv(r, g, b)
+            s2 = max(0, min(1, s * sat_mul))
+            v2 = max(0, min(1, v * val_mul))
+            return _hex(*colorsys.hsv_to_rgb(hh, s2, v2))
+
+        def _rgba_dim(h6, a=0.12):
+            r, g, b = _parse_hex(h6)
+            return f"rgba({int(r*255)},{int(g*255)},{int(b*255)},{a})"
+
+        # ── Extract bg RGB ────────────────────────────────────────────────────
+        m = _re.match(r"rgba[(]([0-9]+),[ ]*([0-9]+),[ ]*([0-9]+)", raw_bg)
+        if m:
+            br, bg_, bb = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        else:
+            mm = _re.match(r"[#]?([0-9a-fA-F]{6})", raw_bg)
+            if mm:
+                br = int(mm.group(1)[0:2],16)
+                bg_ = int(mm.group(1)[2:4],16)
+                bb = int(mm.group(1)[4:6],16)
+            else:
+                br, bg_, bb = 17, 17, 27
+
+        # Is the bg dark or light?
+        luma      = (0.299*br + 0.587*bg_ + 0.114*bb) / 255
+        is_dark   = luma < 0.5 or not self.dark_mode is False
+
+        # ── Derive surface colours from bg ────────────────────────────────────
+        def _step(factor):
+            if is_dark:
+                r2 = min(255, int(br + factor))
+                g2 = min(255, int(bg_ + factor))
+                b2 = min(255, int(bb + factor))
+            else:
+                r2 = max(0, int(br - factor))
+                g2 = max(0, int(bg_ - factor))
+                b2 = max(0, int(bb - factor))
+            return "{:02x}{:02x}{:02x}".format(r2, g2, b2)
+
+        win_bg     = "{:02x}{:02x}{:02x}".format(br, bg_, bb)
+        header_bg  = _step(8)
+        page_bg    = win_bg
+        surface    = _step(17)
+        surface2   = _step(30)
+        surface3   = _step(45)
+        header_sep = surface
+        win_border = surface2
+
+        # ── Text colours ──────────────────────────────────────────────────────
+        text    = raw_text
+        # subtext = text but 40% less saturated / dimmer
+        subtext = _shift(raw_text, sat_mul=0.5, val_mul=0.65)
+
+        # ── Accent-derived colours ────────────────────────────────────────────
+        accent      = raw_accent
+        tab_act_fg  = accent
+        thumb       = surface2
+
+        # Blue: shift accent hue by +30°
+        ar, ag, ab  = _parse_hex(accent)
+        ah, as_, av = colorsys.rgb_to_hsv(ar, ag, ab)
+        blue        = _hex(*colorsys.hsv_to_rgb((ah + 0.083) % 1, as_, av))
+
+        # Red: shift accent hue by -120°
+        red         = _hex(*colorsys.hsv_to_rgb((ah - 0.333) % 1, as_, min(1, av*1.1)))
+
+        # Yellow: shift accent hue to ~50°
+        yellow      = _hex(*colorsys.hsv_to_rgb(0.138, max(0.5, as_), min(1, av*1.05)))
+
+        # Green: shift accent hue to ~130°
+        green_raw   = _hex(*colorsys.hsv_to_rgb(0.361, max(0.4, as_*0.8), min(1, av)))
+
+        scroll_a    = "0.10" if is_dark else "0.18"
+
+        return dict(
+            win_bg=win_bg,       win_border=win_border,
+            header_bg=header_bg, header_sep=header_sep,
+            page_bg=page_bg,
+            tab_fg=subtext,      tab_act_bg=surface,
+            tab_act_fg=accent,   tab_border=surface2,
+            text=text,           subtext=subtext,
+            surface=surface,     surface2=surface2,    surface3=surface3,
+            accent=accent,       accent_dim=_rgba_dim(accent),
+            blue=blue,           blue_dim=_rgba_dim(blue),
+            red=red,             red_dim=_rgba_dim(red),
+            yellow=yellow,       yellow_dim=_rgba_dim(yellow),
+            green=f"#{green_raw}",
+            entry_bg=header_bg,  thumb=thumb,
+            scroll=f"rgba(255,255,255,{scroll_a})",
+        )
+
+    def apply_style(self):
+        p = self._palette()
+        if hasattr(self, "_css_provider"):
+            Gtk.StyleContext.remove_provider_for_screen(
+                Gdk.Screen.get_default(), self._css_provider)
+        self._css_provider = Gtk.CssProvider()
+        self._css_provider.load_from_data(f"""
+            window {{
+                background-color: #{p['win_bg']};
+                border:           2px solid #{p['win_border']};
+                border-radius:    12px;
+            }}
+            * {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                color: #{p['text']};
+            }}
+            notebook {{ background-color: #{p['page_bg']}; }}
+            notebook > header {{
+                background-color: #{p['header_bg']};
+                border-bottom:    1px solid #{p['header_sep']};
+                padding:          6px 10px 0 10px;
+            }}
+            notebook > header tab {{
+                background-color: transparent; color: #{p['tab_fg']};
+                font-size: 13px; font-weight: bold;
+                padding: 10px 18px; border-radius: 8px 8px 0 0;
+                margin-right: 3px; border: 1px solid transparent;
+            }}
+            notebook > header tab:checked {{
+                background-color: #{p['tab_act_bg']}; color: #{p['tab_act_fg']};
+                border-color: #{p['tab_border']};
+            }}
+            notebook > header tab:hover:not(:checked) {{
+                background-color: rgba(255,255,255,0.04); color: #{p['text']};
+            }}
+            notebook > stack {{ background-color: #{p['page_bg']}; }}
+
+            entry {{
+                background-color: #{p['entry_bg']}; color: #{p['text']};
+                border: 1px solid #{p['surface2']}; border-radius: 8px;
+                padding: 9px 12px; font-size: 13px; box-shadow: none;
+            }}
+            entry:focus {{ border-color: #{p['accent']}; box-shadow: none; }}
+
+            button {{
+                background-color: #{p['surface']}; color: #{p['text']};
+                border: 1px solid #{p['surface2']}; border-radius: 9px;
+                padding: 10px 16px; font-size: 13px; font-weight: bold;
+                box-shadow: none;
+            }}
+            button:hover {{
+                background-color: {p['accent_dim']};
+                border-color: #{p['accent']}; color: #{p['accent']};
+            }}
+            button:active {{ background-color: #{p['surface2']}; }}
+
+            .small-btn, #small-btn {{
+                background-color: #{p['surface2']}; color: #{p['subtext']};
+                border: 1px solid #{p['surface3']}; border-radius: 7px;
+                padding: 5px 12px; font-size: 12px; font-weight: normal;
+            }}
+            #small-btn:hover {{
+                background-color: {p['accent_dim']}; color: #{p['accent']};
+                border-color: #{p['accent']};
+            }}
+            #small-btn-accent {{
+                background-color: {p['accent_dim']}; color: #{p['accent']};
+                border: 1px solid #{p['accent']}; border-radius: 7px;
+                padding: 5px 12px; font-size: 12px; font-weight: bold;
+            }}
+
+            #btn-blue  {{ background-color: {p['blue_dim']};   border-color: #{p['blue']};   color: #{p['blue']};   }}
+            #btn-blue:hover  {{ background-color: #{p['blue']};   color: #{p['win_bg']}; }}
+            #btn-red   {{ background-color: {p['red_dim']};    border-color: #{p['red']};    color: #{p['red']};    }}
+            #btn-red:hover   {{ background-color: #{p['red']};    color: #{p['win_bg']}; }}
+            #btn-yellow {{ background-color: {p['yellow_dim']}; border-color: #{p['yellow']}; color: #{p['yellow']}; }}
+            #btn-yellow:hover {{ background-color: #{p['yellow']}; color: #{p['win_bg']}; }}
+
+            #mute-btn {{
+                background-color: transparent; border: 1px solid #{p['surface3']};
+                border-radius: 8px; color: #{p['subtext']};
+                font-size: 12px; padding: 6px 12px; font-weight: normal;
+            }}
+            #mute-btn:hover {{
+                background-color: {p['red_dim']}; border-color: #{p['red']}; color: #{p['red']};
+            }}
+
+            #help-panel {{ background-color: #{p['header_bg']}; border-left: 1px solid #{p['surface2']}; }}
+            #help-panel button {{
+                background-color: transparent; border: none; border-radius: 5px;
+                color: #{p['blue']}; font-size: 11px; padding: 5px 8px; font-weight: normal;
+            }}
+            #help-panel button:hover {{ background-color: {p['blue_dim']}; }}
+
+            scale trough    {{ background-color: #{p['surface2']}; min-height: 10px; border-radius: 5px; }}
+            scale highlight {{ background-color: #{p['accent']}; border-radius: 5px; }}
+            scale slider    {{
+                background-color: #{p['thumb']}; border: 2px solid #{p['accent']};
+                border-radius: 50%; min-width: 18px; min-height: 18px; margin: -4px 0;
+            }}
+            scale slider:hover {{ background-color: #{p['accent']}; }}
+
+            switch {{
+                background-color: #{p['surface2']}; border: 1px solid #{p['surface3']};
+                border-radius: 14px; min-width: 50px; min-height: 26px;
+            }}
+            switch:checked {{ background-color: #{p['accent']}; border-color: #{p['accent']}; }}
+            switch slider {{
+                background-color: #{p['text']}; border-radius: 50%;
+                min-width: 20px; min-height: 20px; margin: 2px;
+            }}
+
+            checkbutton check {{
+                background-color: transparent; border: 2px solid #{p['surface3']};
+                border-radius: 50%; min-width: 18px; min-height: 18px;
+            }}
+            checkbutton check:checked {{ background-color: #{p['accent']}; border-color: #{p['accent']}; }}
+            checkbutton:hover check {{ border-color: #{p['accent']}; }}
+
+            #theme-row {{
+                background-color: #{p['surface']}; border: 1px solid #{p['surface2']};
+                border-radius: 10px; padding: 12px 16px;
+            }}
+            #theme-row:hover {{ background-color: #{p['surface2']}; border-color: #{p['surface3']}; }}
+            #theme-text {{ font-size: 14px; font-weight: bold; }}
+            #dm-icon    {{ font-size: 17px; color: #{p['accent']}; }}
+            #dm-sub     {{ font-size: 12px; color: #{p['subtext']}; }}
+
+            #section-heading {{
+                font-size: 11px; font-weight: bold;
+                color: #{p['subtext']}; letter-spacing: 1px;
+            }}
+            #mono-lbl {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                font-size: 11px; color: #{p['subtext']};
+            }}
+
+            /* Network tab */
+            #net-row {{
+                background-color: #{p['surface']}; border: 1px solid #{p['surface2']};
+                border-radius: 8px; padding: 8px 12px;
+            }}
+            #net-row:hover {{ background-color: #{p['surface2']}; }}
+            #net-active-lbl {{ color: #{p['accent']}; font-weight: bold; font-size: 13px; }}
+            #net-lbl        {{ color: #{p['text']}; font-size: 13px; }}
+
+            /* Font tab */
+            #font-tree {{ background-color: #{p['entry_bg']}; border-radius: 8px; }}
+            #font-preview {{
+                font-size: 16px; color: #{p['text']};
+                background-color: #{p['surface']}; border-radius: 8px;
+                padding: 16px; border: 1px solid #{p['surface2']};
+            }}
+
+            /* Keybind tree */
+            #kb-tree {{ background-color: #{p['entry_bg']}; border-radius: 8px; font-size: 12px; }}
+
+            /* Default apps */
+            #mime-lbl   {{ font-size: 13px; color: #{p['subtext']}; }}
+            #mime-entry {{ font-size: 12px; padding: 6px 10px; }}
+
+            scrollbar {{ background-color: transparent; min-width: 5px; }}
+            scrollbar slider {{
+                background-color: {p['scroll']}; border-radius: 3px; min-height: 28px;
+            }}
+            scrollbar slider:hover {{ background-color: #{p['accent']}; }}
+            separator {{ background-color: #{p['surface2']}; min-height: 1px; }}
+
+            /* Bar style picker buttons */
+            #style-btn {{
+                background-color: #{p['surface']};
+                border: 1px solid #{p['surface2']};
+                border-radius: 8px;
+                padding: 8px 4px;
+                font-size: 12px;
+                font-weight: bold;
+                color: #{p['subtext']};
+            }}
+            #style-btn:hover {{
+                background-color: {p['accent_dim']};
+                border-color: #{p['accent']};
+                color: #{p['accent']};
+            }}
+            #style-btn-active {{
+                background-color: {p['accent_dim']};
+                border: 2px solid #{p['accent']};
+                border-radius: 8px;
+                padding: 8px 4px;
+                font-size: 12px;
+                font-weight: bold;
+                color: #{p['accent']};
+            }}
+            #big-clock {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                padding: 10px 0;
+            }}
+            #swatch {{
+                min-width: 14px; min-height: 14px;
+                border-radius: 3px;
+            }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            self._css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        # Re-colour header title and any markup labels using current palette
+        if hasattr(self, "_header_title"):
+            p = self._palette()
+            self._header_title.set_markup(
+                f"<span size='large' weight='bold' foreground='#{p["accent"]}'>"
+                f"Essentials Settings  "
+                f"<span size='small' foreground='#{p["subtext"]}'>[{WM.name}]</span></span>")
+
+
+EssentialsSettings(); Gtk.main()
+
+EssentialsSettings(); Gtk.main()

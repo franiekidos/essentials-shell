@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+import gi, os, json, subprocess, psutil
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, Gdk, GLib
+
+def _load_theme():
+    try:
+        data    = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
+        current = data.get("current", "catppuccin")
+        return data.get(current, data.get("catppuccin", {}))
+    except:
+        return {"bg":"rgba(17,17,27,0.92)","accent":"#cba6f7","text":"#cdd6f4","radius":"12px"}
+
+T = _load_theme()
+
+# ── Palette (all dark, no flashbangs) ────────────────────────────────────────
+C = dict(
+    bg       = "#11111b",
+    bg2      = "#1e1e2e",
+    bg3      = "#181825",
+    surface  = "#1e1e2e",
+    surface2 = "#313244",
+    surface3 = "#45475a",
+    text     = "#cdd6f4",
+    subtext  = "#a6adc8",
+    accent   = T.get("accent", "#cba6f7"),
+    red      = "#f38ba8",
+    green    = "#a6e3a1",
+    blue     = "#89b4fa",
+    yellow   = "#f9e2af",
+)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+import shutil
+
+def has(cmd):
+    """Return True if `cmd` is on PATH."""
+    return shutil.which(cmd) is not None
+
+def run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd), text=True, stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+def run_ok(*cmd):
+    try:    subprocess.run(list(cmd), check=True, stderr=subprocess.DEVNULL); return True
+    except: return False
+
+# ── Capability detection (done once at startup) ────────────────────────────
+HAS = {
+    "wpctl":        has("wpctl"),
+    "brightnessctl": has("brightnessctl"),
+    "playerctl":    has("playerctl"),
+    "nmcli":        has("nmcli"),
+    "bluetoothctl": has("bluetoothctl"),
+    "makoctl":      has("makoctl"),
+    "dunstctl":     has("dunstctl"),
+    "do_not_disturb": False,  # runtime state, not a tool
+    "psutil":       True,  # imported at top; will fail loudly if missing
+}
+# Check psutil sensors (not all builds support it)
+try:
+    psutil.sensors_temperatures()
+    HAS["sensors"] = True
+except Exception:
+    HAS["sensors"] = False
+
+
+class EssentialsCC(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP,   True)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP,   60)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 18)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        self.connect("key-press-event", lambda w, e: Gtk.main_quit() if e.keyval == Gdk.KEY_Escape else None)
+
+        # Close when clicking outside the CC panel
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("button-press-event", self._on_click_outside)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        inner.set_name("cc-inner")
+        inner.set_margin_start(20); inner.set_margin_end(20)
+        inner.set_margin_top(18);   inner.set_margin_bottom(18)
+        self.add(inner)
+
+        # ── Sections ──────────────────────────────────────────────────────────
+        inner.pack_start(self._build_stats(),         False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
+        inner.pack_start(self._build_sliders(),       False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
+        inner.pack_start(self._build_toggles(),       False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
+        inner.pack_start(self._build_media(),         False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
+        inner.pack_start(self._build_notifications(), False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
+        inner.pack_start(self._build_actions(),       False, False, 0)
+
+        self.apply_style()
+        self.show_all()
+
+        # ── Timers ────────────────────────────────────────────────────────────
+        self._update_stats()
+        self._update_media()
+        GLib.timeout_add(2500, self._update_stats)
+        GLib.timeout_add(2000, self._update_media)
+
+    # ── Separator ─────────────────────────────────────────────────────────────
+    def _sep(self):
+        s = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        s.set_name("cc-sep"); return s
+
+    # ── Section label ─────────────────────────────────────────────────────────
+    def _section_lbl(self, text):
+        l = Gtk.Label(label=text); l.set_halign(Gtk.Align.START)
+        l.set_name("section-lbl"); return l
+
+    # ── Stats row ─────────────────────────────────────────────────────────────
+    def _build_stats(self):
+        box = Gtk.Box(spacing=10, homogeneous=True)
+        self.cpu_lbl  = self._stat_card(box, "󰍛", "CPU")
+        self.ram_lbl  = self._stat_card(box, "󰘚", "RAM")
+        self.disk_lbl = self._stat_card(box, "󰋊", "DISK")
+        self.temp_lbl = self._stat_card(box, "󰔏", "TEMP")
+        return box
+
+    def _stat_card(self, box, icon, name):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.set_name("stat-card")
+        i = Gtk.Label(label=icon); i.set_name("stat-icon")
+        v = Gtk.Label(label="--");  v.set_name("stat-val")
+        n = Gtk.Label(label=name);  n.set_name("stat-name")
+        card.pack_start(i, False, False, 0)
+        card.pack_start(v, False, False, 0)
+        card.pack_start(n, False, False, 0)
+        box.pack_start(card, True, True, 0)
+        return v
+
+    def _update_stats(self):
+        self.cpu_lbl.set_text(f"{int(psutil.cpu_percent())}%")
+        self.ram_lbl.set_text(f"{int(psutil.virtual_memory().percent)}%")
+        try:
+            u = psutil.disk_usage("/")
+            self.disk_lbl.set_text(f"{int(u.percent)}%")
+        except:
+            self.disk_lbl.set_text("--")
+        if HAS["sensors"]:
+            try:
+                temps = psutil.sensors_temperatures()
+                t = next(iter(temps.values()))[0].current
+                self.temp_lbl.set_text(f"{int(t)}°")
+            except:
+                self.temp_lbl.set_text("--")
+        else:
+            self.temp_lbl.set_text("N/A")
+        return True
+
+    # ── Sliders ───────────────────────────────────────────────────────────────
+    def _build_sliders(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        # Volume
+        if HAS["wpctl"]:
+            vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            vh = Gtk.Box(spacing=8)
+            vh.pack_start(Gtk.Label(label="󰕾"), False, False, 0)
+            self.vol_lbl = Gtk.Label(label="Volume"); self.vol_lbl.set_name("slider-lbl")
+            self.vol_pct = Gtk.Label(label="--");     self.vol_pct.set_name("slider-pct")
+            vh.pack_start(self.vol_lbl, False, False, 0)
+            vh.pack_end(self.vol_pct, False, False, 0)
+            self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+            self.vol_scale.set_draw_value(False)
+            self.vol_scale.set_hexpand(True)
+            try:
+                out = run("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@")
+                cur = int(float(out.split(":")[1].strip().split()[0]) * 100)
+            except: cur = 50
+            self.vol_scale.set_value(cur); self.vol_pct.set_text(f"{cur}%")
+            self.vol_scale.connect("value-changed", self._on_vol)
+            vol_box.pack_start(vh, False, False, 0)
+            vol_box.pack_start(self.vol_scale, False, False, 0)
+            box.pack_start(vol_box, False, False, 0)
+        else:
+            box.pack_start(self._unavailable("󰕾", "Volume — wpctl not found"), False, False, 0)
+
+        # Brightness
+        if HAS["brightnessctl"]:
+            bri_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            bh = Gtk.Box(spacing=8)
+            bh.pack_start(Gtk.Label(label="󰃠"), False, False, 0)
+            self.bri_lbl = Gtk.Label(label="Brightness"); self.bri_lbl.set_name("slider-lbl")
+            self.bri_pct = Gtk.Label(label="--");         self.bri_pct.set_name("slider-pct")
+            bh.pack_start(self.bri_lbl, False, False, 0)
+            bh.pack_end(self.bri_pct, False, False, 0)
+            self.bri_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 100, 1)
+            self.bri_scale.set_draw_value(False)
+            self.bri_scale.set_hexpand(True)
+            try:
+                cur_b = int(run("brightnessctl", "g") or 0)
+                max_b = int(run("brightnessctl", "m") or 1)
+                cur_b = int((cur_b / max_b) * 100)
+            except: cur_b = 50
+            self.bri_scale.set_value(cur_b); self.bri_pct.set_text(f"{cur_b}%")
+            self.bri_scale.connect("value-changed", self._on_bri)
+            bri_box.pack_start(bh, False, False, 0)
+            bri_box.pack_start(self.bri_scale, False, False, 0)
+            box.pack_start(bri_box, False, False, 0)
+        else:
+            box.pack_start(self._unavailable("󰃠", "Brightness — brightnessctl not found"), False, False, 0)
+
+        return box
+
+    def _on_vol(self, w):
+        if not HAS["wpctl"]: return
+        v = int(w.get_value()); self.vol_pct.set_text(f"{v}%")
+        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v/100:.2f}"],
+                       stderr=subprocess.DEVNULL)
+        _osd = os.path.expanduser("~/.local/bin/essentials-osd")
+        if os.path.exists(_osd):
+            subprocess.Popen(["python3", _osd, "volume", str(v)],
+                             stderr=subprocess.DEVNULL)
+
+    def _on_bri(self, w):
+        if not HAS["brightnessctl"]: return
+        v = int(w.get_value()); self.bri_pct.set_text(f"{v}%")
+        subprocess.run(["brightnessctl", "set", f"{v}%"], stderr=subprocess.DEVNULL)
+        _osd = os.path.expanduser("~/.local/bin/essentials-osd")
+        if os.path.exists(_osd):
+            subprocess.Popen(["python3", _osd, "bright", str(v)],
+                             stderr=subprocess.DEVNULL)
+
+    # ── Toggles (WiFi + Bluetooth) ────────────────────────────────────────────
+    def _unavailable(self, icon, msg):
+        """Placeholder row shown when a required tool is missing."""
+        row = Gtk.Box(spacing=8); row.set_name("unavail-row")
+        row.pack_start(Gtk.Label(label=icon), False, False, 0)
+        lbl = Gtk.Label(label=msg); lbl.set_name("unavail-lbl")
+        lbl.set_halign(Gtk.Align.START)
+        row.pack_start(lbl, False, False, 0)
+        return row
+
+    def _build_toggles(self):
+        box = Gtk.Box(spacing=10, homogeneous=True)
+
+        # WiFi
+        self.wifi_state = self._wifi_enabled()
+        wifi_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        wifi_card.set_name("toggle-card")
+        wh = Gtk.Box(spacing=8)
+        wifi_icon = Gtk.Label(label="󰖩"); wifi_icon.set_name("toggle-icon")
+        wh.pack_start(wifi_icon, False, False, 0)
+        wh.pack_start(Gtk.Label(label="Wi-Fi"), False, False, 0)
+        self.wifi_sw = Gtk.Switch(); self.wifi_sw.set_active(self.wifi_state)
+        self.wifi_sw.set_halign(Gtk.Align.END)
+        wh.pack_end(self.wifi_sw, False, False, 0)
+        self.wifi_ssid = Gtk.Label(label=self._wifi_ssid())
+        self.wifi_ssid.set_name("toggle-sub")
+        self.wifi_ssid.set_halign(Gtk.Align.START)
+        self.wifi_ssid.set_ellipsize(3)
+        wifi_card.pack_start(wh,             False, False, 0)
+        wifi_card.pack_start(self.wifi_ssid, False, False, 0)
+        if HAS["nmcli"]:
+            self.wifi_sw.connect("notify::active", self._on_wifi_toggle)
+            box.pack_start(wifi_card, True, True, 0)
+        else:
+            box.pack_start(self._unavailable("󰖩", "Wi-Fi  (nmcli not found)"), True, True, 0)
+
+        # Bluetooth
+        self.bt_state = self._bt_enabled()
+        bt_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        bt_card.set_name("toggle-card")
+        bh = Gtk.Box(spacing=8)
+        bt_icon = Gtk.Label(label="󰂯"); bt_icon.set_name("toggle-icon")
+        bh.pack_start(bt_icon, False, False, 0)
+        bh.pack_start(Gtk.Label(label="Bluetooth"), False, False, 0)
+        self.bt_sw = Gtk.Switch(); self.bt_sw.set_active(self.bt_state)
+        self.bt_sw.set_halign(Gtk.Align.END)
+        bh.pack_end(self.bt_sw, False, False, 0)
+        self.bt_dev = Gtk.Label(label=self._bt_device())
+        self.bt_dev.set_name("toggle-sub")
+        self.bt_dev.set_halign(Gtk.Align.START)
+        self.bt_dev.set_ellipsize(3)
+        bt_card.pack_start(bh,          False, False, 0)
+        bt_card.pack_start(self.bt_dev, False, False, 0)
+        if HAS["bluetoothctl"]:
+            self.bt_sw.connect("notify::active", self._on_bt_toggle)
+            box.pack_start(bt_card, True, True, 0)
+        else:
+            box.pack_start(self._unavailable("󰂯", "Bluetooth  (bluetoothctl not found)"), True, True, 0)
+
+        return box
+
+    def _wifi_enabled(self):
+        if not HAS["nmcli"]: return False
+        return run("nmcli", "radio", "wifi", fallback="disabled").strip() == "enabled"
+
+    def _wifi_ssid(self):
+        if not HAS["nmcli"]: return "nmcli not found"
+        try:
+            lines = run("nmcli", "-t", "-f", "active,ssid", "dev", "wifi").splitlines()
+            ssids = [l.split(":")[1] for l in lines if l.startswith("yes:")]
+            return ssids[0] if ssids else "Not connected"
+        except: return "Not connected"
+
+    def _bt_enabled(self):
+        if not HAS["bluetoothctl"]: return False
+        out = run("bluetoothctl", "show", fallback="")
+        return "Powered: yes" in out
+
+    def _bt_device(self):
+        if not HAS["bluetoothctl"]: return "bluetoothctl not found"
+        out = run("bluetoothctl", "info", fallback="")
+        for line in out.splitlines():
+            if "Name:" in line: return line.split("Name:")[1].strip()
+        return "No device"
+
+    def _on_wifi_toggle(self, sw, _param):
+        if not HAS["nmcli"]: return
+        state = "on" if sw.get_active() else "off"
+        subprocess.run(["nmcli", "radio", "wifi", state], stderr=subprocess.DEVNULL)
+        GLib.timeout_add(1200, lambda: (
+            self.wifi_ssid.set_text(self._wifi_ssid()), False
+        ))
+
+    def _on_bt_toggle(self, sw, _param):
+        if not HAS["bluetoothctl"]: return
+        state = "on" if sw.get_active() else "off"
+        subprocess.run(["bluetoothctl", "power", state], stderr=subprocess.DEVNULL)
+        GLib.timeout_add(800, lambda: (
+            self.bt_dev.set_text(self._bt_device()), False
+        ))
+
+    # ── Media card ────────────────────────────────────────────────────────────
+    def _build_media(self):
+        if not HAS["playerctl"]:
+            row = self._unavailable("󰝚", "Media — playerctl not found")
+            row.set_name("media-card"); return row
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.set_name("media-card")
+
+        # Title + artist
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.m_title  = Gtk.Label(label="Nothing playing")
+        self.m_title.set_name("media-title")
+        self.m_title.set_halign(Gtk.Align.START)
+        self.m_title.set_ellipsize(3)
+        self.m_artist = Gtk.Label(label="—")
+        self.m_artist.set_name("media-artist")
+        self.m_artist.set_halign(Gtk.Align.START)
+        self.m_artist.set_ellipsize(3)
+        info.pack_start(self.m_title,  False, False, 0)
+        info.pack_start(self.m_artist, False, False, 0)
+        card.pack_start(info, False, False, 0)
+
+        # Progress bar
+        self.m_progress = Gtk.ProgressBar()
+        self.m_progress.set_name("media-progress")
+        self.m_progress.set_fraction(0)
+        card.pack_start(self.m_progress, False, False, 0)
+
+        # Controls
+        ctrl = Gtk.Box(spacing=0, homogeneous=True)
+        ctrl.set_name("media-controls")
+        for icon, cmd in [("󰒮", "previous"), ("󰐊", "play-pause"), ("󰒭", "next")]:
+            b = Gtk.Button(label=icon); b.set_name("media-btn")
+            b.connect("clicked", lambda w, c=cmd: subprocess.run(
+                ["playerctl", c], stderr=subprocess.DEVNULL))
+            ctrl.pack_start(b, True, True, 0)
+        card.pack_start(ctrl, False, False, 0)
+        return card
+
+    def _update_media(self):
+        if not HAS["playerctl"]: return False
+        title  = run("playerctl", "metadata", "title",  fallback="")
+        artist = run("playerctl", "metadata", "artist", fallback="")
+        status = run("playerctl", "status",              fallback="Stopped")
+
+        if title:
+            self.m_title.set_text(title)
+            self.m_artist.set_text(artist or "Unknown artist")
+            play_icon = "󰏤" if status == "Playing" else "󰐊"
+            # update play/pause button icon
+            ctrl = self.m_progress.get_parent().get_children()[2]
+            ctrl.get_children()[1].set_label(play_icon)
+            # progress
+            try:
+                pos = float(run("playerctl", "position", fallback="0") or 0)
+                length_us = float(run("playerctl", "metadata", "mpris:length", fallback="0") or 0)
+                if length_us > 0:
+                    self.m_progress.set_fraction(min(pos / (length_us / 1e6), 1.0))
+            except: pass
+        else:
+            self.m_title.set_text("Nothing playing")
+            self.m_artist.set_text("—")
+            self.m_progress.set_fraction(0)
+        return True
+
+    # ── Notifications ─────────────────────────────────────────────────────────
+    def _build_notifications(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        hdr = Gtk.Box(spacing=8)
+        lbl = self._section_lbl("󰂚  Notifications")
+        clr = Gtk.Button(label="Clear"); clr.set_name("notif-clear-btn")
+        clr.connect("clicked", self._clear_notifications)
+
+        # DND toggle
+        dnd_lbl = Gtk.Label(label="󰂛"); dnd_lbl.set_name("toggle-icon")
+        self._dnd_sw = Gtk.Switch(); self._dnd_sw.set_active(HAS["do_not_disturb"])
+        self._dnd_sw.connect("notify::active", self._on_dnd_toggle)
+        dnd_box = Gtk.Box(spacing=4)
+        dnd_box.pack_start(dnd_lbl,      False, False, 0)
+        dnd_box.pack_start(self._dnd_sw, False, False, 0)
+
+        hdr.pack_start(lbl,     True,  True,  0)
+        hdr.pack_start(dnd_box, False, False, 4)
+        hdr.pack_end(clr,       False, False, 0)
+        box.pack_start(hdr, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(10)
+        scroll.set_max_content_height(180)
+        self.notif_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        scroll.add(self.notif_box)
+        box.pack_start(scroll, False, False, 0)
+
+        self._load_notifications()
+        return box
+
+    def _get_notifications(self):
+        """Try makoctl then dunstctl for notification history."""
+        if not HAS["makoctl"] and not HAS["dunstctl"]:
+            return []
+        # mako
+        raw = run("makoctl", "history", fallback="") if HAS["makoctl"] else ""
+        if raw:
+            try:
+                items = json.loads(raw)
+                notifs = []
+                for group in (items if isinstance(items, list) else [items]):
+                    for n in (group if isinstance(group, list) else [group]):
+                        app   = n.get("app-name", {}).get("data", "App")
+                        body  = n.get("body",     {}).get("data", "")
+                        notifs.append((str(app), str(body)))
+                return notifs[-8:][::-1]
+            except: pass
+
+        # dunst
+        raw = run("dunstctl", "history", fallback="") if HAS["dunstctl"] else ""
+        if raw:
+            try:
+                data   = json.loads(raw)
+                items  = data.get("data", [[]])[0]
+                notifs = []
+                for n in items:
+                    app  = n.get("appname",  {}).get("data", "App")
+                    body = n.get("body",     {}).get("data", "")
+                    notifs.append((str(app), str(body)))
+                return notifs[:8]
+            except: pass
+
+        return []
+
+    def _on_dnd_toggle(self, sw, _p):
+        HAS["do_not_disturb"] = sw.get_active()
+        if sw.get_active():
+            if HAS["makoctl"]:  run_ok("makoctl","set-mode","do-not-disturb")
+            if HAS["dunstctl"]: run_ok("dunstctl","set-paused","true")
+        else:
+            if HAS["makoctl"]:  run_ok("makoctl","set-mode","default")
+            if HAS["dunstctl"]: run_ok("dunstctl","set-paused","false")
+
+    def _load_notifications(self):
+        for c in self.notif_box.get_children():
+            self.notif_box.remove(c)
+
+        notifs = self._get_notifications()
+        if not notifs:
+            if not HAS["makoctl"] and not HAS["dunstctl"]:
+                msg = "No notification daemon  (install mako or dunst)"
+            else:
+                msg = "No recent notifications"
+            empty = Gtk.Label(label=msg)
+            empty.set_name("notif-empty"); empty.set_halign(Gtk.Align.START)
+            self.notif_box.pack_start(empty, False, False, 0)
+        else:
+            for app, body in notifs:
+                row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                row.set_name("notif-row")
+                app_lbl  = Gtk.Label(label=app);            app_lbl.set_name("notif-app")
+                app_lbl.set_halign(Gtk.Align.START)
+                body_lbl = Gtk.Label(label=body[:80] + ("…" if len(body) > 80 else ""))
+                body_lbl.set_name("notif-body")
+                body_lbl.set_halign(Gtk.Align.START)
+                body_lbl.set_line_wrap(True)
+                row.pack_start(app_lbl,  False, False, 0)
+                row.pack_start(body_lbl, False, False, 0)
+                self.notif_box.pack_start(row, False, False, 0)
+
+        self.notif_box.show_all()
+
+    def _clear_notifications(self, *_):
+        if HAS["makoctl"]:   run_ok("makoctl", "dismiss", "--all")
+        if HAS["dunstctl"]:  run_ok("dunstctl", "close-all")
+        self._load_notifications()
+
+    # ── Action row ────────────────────────────────────────────────────────────
+    def _build_actions(self):
+        box = Gtk.Box(spacing=10, homogeneous=True)
+        pwr  = Gtk.Button(label="󰐥  Power");     pwr.set_name("action-pwr")
+        lock = Gtk.Button(label="󰌾  Lock");      lock.set_name("action-set")
+        wall = Gtk.Button(label="󰋩  Wallpaper"); wall.set_name("action-set")
+        cfg  = Gtk.Button(label="󰒓  Settings");  cfg.set_name("action-set")
+        pwr.connect("clicked", lambda *_: [
+            subprocess.Popen(["python3", os.path.expanduser("~/.local/bin/essentials-powermenu")]),
+            Gtk.main_quit()])
+        lock.connect("clicked", lambda *_: [
+            subprocess.Popen(["python3", os.path.expanduser("~/.local/bin/essentials-lockscreen")]),
+            Gtk.main_quit()])
+        wall.connect("clicked", lambda *_: [
+            subprocess.Popen(["python3", os.path.expanduser("~/.local/bin/essentials-wallpaper")]),
+            Gtk.main_quit()])
+        cfg.connect("clicked", lambda *_: [
+            subprocess.Popen(["python3", os.path.expanduser("~/.local/bin/essentials-settings")]),
+            Gtk.main_quit()])
+        box.pack_start(pwr,  True, True, 0)
+        box.pack_start(lock, True, True, 0)
+        box.pack_start(wall, True, True, 0)
+        box.pack_start(cfg,  True, True, 0)
+        return box
+
+    # ── Stylesheet ────────────────────────────────────────────────────────────
+    def _on_click_outside(self, win, event):
+        """Dismiss CC if the click lands outside the inner content box."""
+        child = win.get_child()
+        if child is None:
+            Gtk.main_quit()
+            return False
+        alloc = child.get_allocation()
+        x, y = int(event.x), int(event.y)
+        if not (alloc.x <= x <= alloc.x + alloc.width and
+                alloc.y <= y <= alloc.y + alloc.height):
+            Gtk.main_quit()
+        return False
+
+    def apply_style(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+            /* Shell */
+            window {{
+                background-color: {C['bg']};
+                border:           2px solid {C['surface2']};
+                border-radius:    16px;
+                min-width:        560px;
+            }}
+            #cc-inner {{ background-color: {C['bg']}; }}
+
+            /* Global text */
+            * {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                color:       {C['text']};
+            }}
+
+            /* Separator */
+            #cc-sep {{
+                background-color: {C['surface2']};
+                min-height:       1px;
+                margin:           2px 0;
+            }}
+
+            /* Section label */
+            .section-lbl {{
+                font-size:   11px;
+                font-weight: bold;
+                color:       {C['subtext']};
+                letter-spacing: 1px;
+            }}
+            #section-lbl {{
+                font-size:  13px;
+                color:      {C['subtext']};
+                font-weight: bold;
+            }}
+
+            /* ── Stats ── */
+            #stat-card {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    12px;
+                padding:          10px 8px;
+            }}
+            #stat-icon {{
+                font-size: 22px;
+                color:     {C['accent']};
+            }}
+            #stat-val {{
+                font-size:   15px;
+                font-weight: bold;
+                color:       {C['text']};
+            }}
+            #stat-name {{
+                font-size: 11px;
+                color:     {C['subtext']};
+            }}
+
+            /* ── Sliders ── */
+            #slider-lbl {{
+                font-size: 15px;
+                color:     {C['text']};
+            }}
+            #slider-pct {{
+                font-size: 14px;
+                color:     {C['subtext']};
+            }}
+            scale trough {{
+                background-color: {C['surface2']};
+                min-height:       10px;
+                border-radius:    5px;
+            }}
+            scale highlight {{
+                background-color: {C['accent']};
+                border-radius:    4px;
+            }}
+            scale slider {{
+                background-color: {C['accent']};
+                border-radius:    50%;
+                min-width:        20px;
+                min-height:       20px;
+                margin:           -4px 0;
+                border:           2px solid {C['bg']};
+            }}
+            scale slider:hover {{ background-color: white; }}
+
+            /* ── Toggles ── */
+            #toggle-card {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    12px;
+                padding:          12px;
+            }}
+            #toggle-icon {{
+                font-size: 22px;
+                color:     {C['accent']};
+            }}
+            #toggle-sub {{
+                font-size: 13px;
+                color:     {C['subtext']};
+            }}
+            switch {{
+                background-color: {C['surface2']};
+                border:           1px solid {C['surface3']};
+                border-radius:    14px;
+                min-width:        52px;
+                min-height:       28px;
+            }}
+            switch:checked {{
+                background-color: {C['accent']};
+                border-color:     {C['accent']};
+            }}
+            switch slider {{
+                background-color: {C['text']};
+                border-radius:    50%;
+                min-width:        22px;
+                min-height:       22px;
+                margin:           2px;
+            }}
+
+            /* ── Media card ── */
+            #media-card {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    14px;
+                padding:          14px;
+            }}
+            #media-title {{
+                font-size:   17px;
+                font-weight: bold;
+                color:       {C['text']};
+            }}
+            #media-artist {{
+                font-size: 14px;
+                color:     {C['subtext']};
+            }}
+            #media-progress {{
+                min-height:    8px;
+                border-radius: 4px;
+            }}
+            #media-progress trough {{
+                background-color: {C['surface2']};
+                border-radius:    3px;
+                min-height:       8px;
+            }}
+            #media-progress progress {{
+                background-color: {C['accent']};
+                border-radius:    3px;
+            }}
+            #media-controls {{
+                margin-top: 4px;
+            }}
+            #media-btn {{
+                background-color: transparent;
+                border:           none;
+                border-radius:    10px;
+                font-size:        28px;
+                color:            {C['text']};
+                padding:          12px;
+            }}
+            #media-btn:hover {{
+                background-color: {C['surface2']};
+                color:            {C['accent']};
+            }}
+
+            /* ── Notifications ── */
+            #notif-clear-btn {{
+                background-color: transparent;
+                border:           1px solid {C['surface3']};
+                border-radius:    6px;
+                color:            {C['subtext']};
+                font-size:        11px;
+                padding:          3px 10px;
+                font-weight:      normal;
+            }}
+            #notif-clear-btn:hover {{
+                background-color: {C['red']};
+                border-color:     {C['red']};
+                color:            {C['bg']};
+            }}
+            #notif-row {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    10px;
+                padding:          8px 10px;
+            }}
+            #notif-app {{
+                font-size:   13px;
+                font-weight: bold;
+                color:       {C['accent']};
+            }}
+            #notif-body {{
+                font-size: 12px;
+                color:     {C['subtext']};
+            }}
+            #notif-empty {{
+                font-size: 12px;
+                color:     {C['surface3']};
+                padding:   8px 0;
+            }}
+
+            /* ── Action buttons ── */
+            #action-pwr, #action-set {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    10px;
+                padding:          16px;
+                font-size:        15px;
+                font-weight:      bold;
+                color:            {C['text']};
+            }}
+            #action-pwr:hover {{
+                background-color: rgba(243,139,168,0.18);
+                border-color:     {C['red']};
+                color:            {C['red']};
+            }}
+            #action-set:hover {{
+                background-color: rgba(203,166,247,0.15);
+                border-color:     {C['accent']};
+                color:            {C['accent']};
+            }}
+
+            /* Unavailable rows */
+            #unavail-row {{
+                background-color: {C['surface']};
+                border:           1px dashed {C['surface3']};
+                border-radius:    10px;
+                padding:          10px 14px;
+            }}
+            #unavail-lbl {{
+                font-size: 12px;
+                color:     {C['subtext']};
+            }}
+
+            /* Scrollbar */
+            scrollbar {{ background-color: transparent; min-width: 4px; }}
+            scrollbar slider {{
+                background-color: {C['surface2']};
+                border-radius:    2px;
+                min-height:       24px;
+            }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+
+EssentialsCC(); Gtk.main()

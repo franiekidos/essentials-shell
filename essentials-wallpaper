@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+essentials-wallpaper — Wallpaper manager with Wallhaven integration
+
+Features:
+  - Browse local wallpaper directories
+  - Search and download from Wallhaven (api.wallhaven.cc)
+  - Set wallpaper via swww / hyprpaper / swaybg / feh (auto-detected)
+  - Generate a color theme from the current wallpaper (saved to themes.json)
+  - Persists last wallpaper so it auto-restores on login
+
+Wallhaven API key (optional, for NSFW/account searches):
+  Set "wallhaven_apikey" in ~/.config/essentials/config.json
+"""
+import gi, os, json, subprocess, threading, shutil, colorsys, struct, zlib
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk, GdkPixbuf
+from urllib.request import urlopen, urlretrieve, Request
+from urllib.parse   import urlencode
+from urllib.error   import URLError
+
+THEME_PATH  = os.path.expanduser("~/.config/essentials/themes.json")
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+WALL_DIR    = os.path.expanduser("~/.config/essentials/wallpapers")
+CACHE_DIR   = os.path.expanduser("~/.cache/essentials/wallhaven")
+os.makedirs(WALL_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def _load_config():
+    try:
+        with open(CONFIG_PATH) as f: return json.load(f)
+    except: return {}
+
+def _save_config(data):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+def _load_theme():
+    try:
+        data = json.load(open(THEME_PATH))
+        cur  = data.get("current","catppuccin")
+        return data.get(cur, data.get("catppuccin",{}))
+    except:
+        return {"bg":"rgba(17,17,27,0.92)","accent":"#cba6f7","text":"#cdd6f4","radius":"12px"}
+
+T   = _load_theme()
+CFG = _load_config()
+
+def _run(*cmd, fallback=""):
+    try:    return subprocess.check_output(list(cmd),text=True,stderr=subprocess.DEVNULL).strip()
+    except: return fallback
+
+# ── Wallpaper setters (auto-detect tool) ──────────────────────────────────────
+
+def _detect_setter():
+    for tool in ("swww","hyprpaper","swaybg","feh","wbg"):
+        if shutil.which(tool): return tool
+    return None
+
+def set_wallpaper(path):
+    tool = _detect_setter()
+    if not tool:
+        return False, "No wallpaper tool found (install swww, swaybg, hyprpaper, or feh)"
+    path = os.path.abspath(path)
+    try:
+        if tool == "swww":
+            # swww needs daemon running
+            subprocess.Popen(["swww","init"], stderr=subprocess.DEVNULL)
+            GLib.timeout_add(500, lambda: (
+                subprocess.run(["swww","img",path,"--transition-type","wipe"],
+                               stderr=subprocess.DEVNULL), False))
+        elif tool == "swaybg":
+            # Kill old instance
+            subprocess.run(["pkill","swaybg"], stderr=subprocess.DEVNULL)
+            subprocess.Popen(["swaybg","-i",path,"-m","fill"])
+        elif tool == "hyprpaper":
+            subprocess.run(["hyprctl","hyprpaper","preload",path], stderr=subprocess.DEVNULL)
+            subprocess.run(["hyprctl","hyprpaper","wallpaper",f",{path}"], stderr=subprocess.DEVNULL)
+        elif tool == "feh":
+            subprocess.Popen(["feh","--bg-fill",path])
+        elif tool == "wbg":
+            subprocess.run(["pkill","wbg"], stderr=subprocess.DEVNULL)
+            subprocess.Popen(["wbg",path])
+
+        # Persist
+        cfg = _load_config()
+        cfg["wallpaper"] = path
+        _save_config(cfg)
+        return True, f"Set via {tool}"
+    except Exception as e:
+        return False, str(e)
+
+def restore_wallpaper():
+    cfg  = _load_config()
+    wall = cfg.get("wallpaper")
+    if wall and os.path.exists(wall):
+        set_wallpaper(wall)
+
+# ── Color extraction from image (PIL) ────────────────────────────────────────
+
+def _extract_palette(path, n_colors=8):
+    """Extract dominant colours from an image using PIL quantize."""
+    try:
+        from PIL import Image
+        img    = Image.open(path).convert("RGB")
+        img.thumbnail((200,200))
+        quant  = img.quantize(colors=n_colors, method=Image.Quantize.FASTOCTREE)
+        pal    = quant.getpalette()[:n_colors*3]
+        colors = [(pal[i],pal[i+1],pal[i+2]) for i in range(0,len(pal),3)]
+        # Sort by saturation descending to get vivid colours first
+        def sat(c):
+            r,g,b = [x/255 for x in c]
+            h,s,v = colorsys.rgb_to_hsv(r,g,b)
+            return s
+        return sorted(colors, key=sat, reverse=True)
+    except Exception as e:
+        print(f"[wallpaper] palette extraction failed: {e}")
+        return []
+
+def generate_theme_from_wallpaper(path, theme_name="wallpaper"):
+    """Generate a theme dict from the wallpaper and save it to themes.json."""
+    colors = _extract_palette(path)
+    if not colors:
+        return None, "Could not extract colours (PIL required)"
+
+    def _hex(c): return "#{:02x}{:02x}{:02x}".format(*c)
+    def _dark(c, factor=0.15):
+        r,g,b = [x/255 for x in c]
+        h,s,v = colorsys.rgb_to_hsv(r,g,b)
+        v2     = max(0.05, v*factor)
+        r2,g2,b2 = colorsys.hsv_to_rgb(h,s,v2)
+        return (int(r2*255),int(g2*255),int(b2*255))
+
+    # accent = most saturated colour
+    # bg     = very dark version of that hue
+    # text   = near-white
+    accent_rgb = colors[0]
+    bg_rgb     = _dark(accent_rgb, 0.12)
+    text_rgb   = (220, 220, 230)
+
+    theme = {
+        "bg":     f"rgba({bg_rgb[0]},{bg_rgb[1]},{bg_rgb[2]},0.92)",
+        "accent": _hex(accent_rgb),
+        "text":   _hex(text_rgb),
+        "radius": "12px",
+        "font":   "JetBrainsMono Nerd Font",
+    }
+
+    try:
+        data = json.load(open(THEME_PATH)) if os.path.exists(THEME_PATH) else {}
+        data[theme_name] = theme
+        with open(THEME_PATH,"w") as f: json.dump(data,f,indent=4)
+    except Exception as e:
+        return None, str(e)
+
+    return theme, f"Theme '{theme_name}' generated and saved."
+
+# ── Wallhaven API ─────────────────────────────────────────────────────────────
+
+WALLHAVEN_SEARCH = "https://wallhaven.cc/api/v1/search"
+WALLHAVEN_INFO   = "https://wallhaven.cc/api/v1/w/{id}"
+THUMB_SIZE       = (320, 180)
+
+def _wh_search(query, page=1, categories="110", purity="100", sorting="relevance"):
+    params = {"q":query,"page":page,"categories":categories,
+              "purity":purity,"sorting":sorting,"atleast":"1920x1080"}
+    apikey = CFG.get("wallhaven_apikey","")
+    if apikey: params["apikey"] = apikey
+    url = f"{WALLHAVEN_SEARCH}?{urlencode(params)}"
+    try:
+        req  = Request(url, headers={"User-Agent":"essentials-shell/1.0"})
+        data = json.loads(urlopen(req, timeout=10).read())
+        return data.get("data",[])
+    except Exception as e:
+        print(f"[wallhaven] search failed: {e}")
+        return []
+
+def _wh_download(thumb_url, full_url, wh_id):
+    """Download thumbnail to cache, return local path."""
+    thumb_path = os.path.join(CACHE_DIR, f"{wh_id}_thumb.jpg")
+    if not os.path.exists(thumb_path):
+        try:
+            req = Request(thumb_url, headers={"User-Agent":"essentials-shell/1.0"})
+            data = urlopen(req, timeout=8).read()
+            with open(thumb_path,"wb") as f: f.write(data)
+        except Exception as e:
+            print(f"[wallhaven] thumb download failed: {e}")
+            return None
+    return thumb_path
+
+def _wh_download_full(full_url, wh_id):
+    """Download full-resolution wallpaper to WALL_DIR."""
+    ext  = full_url.rsplit(".",1)[-1]
+    path = os.path.join(WALL_DIR, f"wallhaven_{wh_id}.{ext}")
+    if os.path.exists(path): return path
+    try:
+        req = Request(full_url, headers={"User-Agent":"essentials-shell/1.0"})
+        data = urlopen(req, timeout=30).read()
+        with open(path,"wb") as f: f.write(data)
+        return path
+    except Exception as e:
+        print(f"[wallhaven] full download failed: {e}")
+        return None
+
+# ── Main window ───────────────────────────────────────────────────────────────
+
+class WallpaperManager(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                     GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(self, edge, False)
+        self.connect("key-press-event",
+                     lambda w,e: Gtk.main_quit() if e.keyval == Gdk.KEY_Escape else None)
+        self._current_results = []
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_name("wm-root"); self.add(root)
+
+        # Header
+        hdr = Gtk.Box(spacing=10)
+        hdr.set_name("wm-header")
+        hdr.set_margin_start(20); hdr.set_margin_end(20)
+        hdr.set_margin_top(14);   hdr.set_margin_bottom(14)
+        title = Gtk.Label()
+        title.set_markup("<span size='large' weight='bold' foreground='#cba6f7'>"
+                         "󰋩  Wallpaper Manager</span>")
+        close = Gtk.Button(label="✕"); close.set_size_request(32,32)
+        close.connect("clicked", lambda _: Gtk.main_quit())
+        hdr.pack_start(title, False, False, 0)
+        hdr.pack_end(close,   False, False, 0)
+        root.pack_start(hdr, False, False, 0)
+
+        # Notebook: Local | Wallhaven
+        nb = Gtk.Notebook(); nb.set_name("wm-nb")
+        root.pack_start(nb, True, True, 0)
+        nb.append_page(self._build_local_tab(),    Gtk.Label(label="󰉏 Local"))
+        nb.append_page(self._build_wallhaven_tab(), Gtk.Label(label="󰖟 Wallhaven"))
+
+        self._apply_style()
+        self.set_size_request(1000, 680)
+        self.show_all()
+
+    # ── Local tab ─────────────────────────────────────────────────────────────
+    def _build_local_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_margin_start(16); page.set_margin_end(16)
+        page.set_margin_top(14);   page.set_margin_bottom(14)
+
+        # Directory row
+        dir_row = Gtk.Box(spacing=8)
+        self._dir_entry = Gtk.Entry(); self._dir_entry.set_text(WALL_DIR)
+        self._dir_entry.set_hexpand(True)
+        browse_btn = Gtk.Button(label="Browse"); browse_btn.set_name("small-btn")
+        browse_btn.connect("clicked", self._browse_dir)
+        scan_btn = Gtk.Button(label="󰑓 Scan"); scan_btn.set_name("small-btn")
+        scan_btn.connect("clicked", lambda _: self._scan_local())
+        dir_row.pack_start(self._dir_entry, True,  True,  0)
+        dir_row.pack_start(browse_btn,      False, False, 0)
+        dir_row.pack_start(scan_btn,        False, False, 0)
+        page.pack_start(dir_row, False, False, 0)
+
+        # Thumbnail grid
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._local_flow = Gtk.FlowBox()
+        self._local_flow.set_max_children_per_line(4)
+        self._local_flow.set_min_children_per_line(2)
+        self._local_flow.set_column_spacing(10)
+        self._local_flow.set_row_spacing(10)
+        self._local_flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        scroll.add(self._local_flow)
+        page.pack_start(scroll, True, True, 0)
+
+        # Bottom bar
+        bot = Gtk.Box(spacing=10)
+        self._local_status = Gtk.Label(label=""); self._local_status.set_halign(Gtk.Align.START)
+        self._local_status.set_name("mono-lbl")
+        set_btn    = Gtk.Button(label="󰋩 Set Wallpaper"); set_btn.set_name("btn-blue")
+        set_btn.connect("clicked", self._set_local)
+        gen_btn    = Gtk.Button(label="󰏘 Generate Theme")
+        gen_btn.connect("clicked", self._gen_theme_local)
+        bot.pack_start(self._local_status, True,  True,  0)
+        bot.pack_start(gen_btn,            False, False, 0)
+        bot.pack_start(set_btn,            False, False, 0)
+        page.pack_start(bot, False, False, 0)
+
+        GLib.idle_add(self._scan_local)
+        return page
+
+    def _browse_dir(self, _):
+        dlg = Gtk.FileChooserDialog(title="Choose wallpaper directory",
+            parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self._dir_entry.set_text(dlg.get_filename())
+            self._scan_local()
+        dlg.destroy()
+
+    def _scan_local(self):
+        for c in self._local_flow.get_children(): self._local_flow.remove(c)
+        d    = self._dir_entry.get_text()
+        exts = {".jpg",".jpeg",".png",".webp",".gif"}
+        try:
+            files = [os.path.join(d,f) for f in sorted(os.listdir(d))
+                     if os.path.splitext(f)[1].lower() in exts]
+        except: files = []
+        self._local_status.set_text(f"{len(files)} wallpapers found")
+        for path in files:
+            GLib.idle_add(self._add_local_thumb, path)
+        return False
+
+    def _add_local_thumb(self, path):
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 220, 124, True)
+            img  = Gtk.Image.new_from_pixbuf(pb)
+            btn  = Gtk.Button(); btn.set_name("thumb-btn")
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            vbox.pack_start(img, False, False, 0)
+            name_lbl = Gtk.Label(label=os.path.basename(path)[:22])
+            name_lbl.set_name("thumb-lbl")
+            vbox.pack_start(name_lbl, False, False, 0)
+            btn.add(vbox)
+            btn.connect("clicked", lambda _, p=path: self._preview_select(p, "local"))
+            btn.set_tooltip_text(path)
+            self._local_flow.add(btn)
+            self._local_flow.show_all()
+        except Exception as e:
+            print(f"[wallpaper] thumb failed {path}: {e}")
+        return False
+
+    def _preview_select(self, path, source):
+        self._selected_path   = path
+        self._selected_source = source
+
+    def _set_local(self, _):
+        path = getattr(self,"_selected_path", None)
+        if not path:
+            self._local_status.set_text("Select a wallpaper first")
+            return
+        ok, msg = set_wallpaper(path)
+        self._local_status.set_markup(
+            f"<span foreground='{'#a6e3a1' if ok else '#f38ba8'}'>{'✓' if ok else '✗'} {msg}</span>")
+
+    def _gen_theme_local(self, _):
+        path = getattr(self,"_selected_path", None)
+        if not path:
+            self._local_status.set_text("Select a wallpaper first")
+            return
+        self._local_status.set_text("Generating theme…")
+        def _do():
+            theme, msg = generate_theme_from_wallpaper(path)
+            GLib.idle_add(lambda: (self._local_status.set_markup(
+                f"<span foreground='{'#a6e3a1' if theme else '#f38ba8'}'>{'✓' if theme else '✗'} {msg}</span>"), False))
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Wallhaven tab ─────────────────────────────────────────────────────────
+    def _build_wallhaven_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_margin_start(16); page.set_margin_end(16)
+        page.set_margin_top(14);   page.set_margin_bottom(14)
+
+        # Search bar
+        search_row = Gtk.Box(spacing=8)
+        self._wh_entry = Gtk.SearchEntry()
+        self._wh_entry.set_placeholder_text("Search Wallhaven (e.g. 'anime city night')…")
+        self._wh_entry.set_hexpand(True)
+        self._wh_entry.connect("activate", self._wh_search_go)
+        search_btn = Gtk.Button(label="Search"); search_btn.set_name("btn-blue")
+        search_btn.connect("clicked", self._wh_search_go)
+
+        # Sorting
+        self._wh_sort = Gtk.ComboBoxText()
+        for s in ("relevance","date_added","views","favorites","toplist","random"):
+            self._wh_sort.append_text(s)
+        self._wh_sort.set_active(0)
+
+        search_row.pack_start(self._wh_entry, True,  True,  0)
+        search_row.pack_start(self._wh_sort,  False, False, 0)
+        search_row.pack_start(search_btn,     False, False, 0)
+        page.pack_start(search_row, False, False, 0)
+
+        # Results grid
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._wh_flow = Gtk.FlowBox()
+        self._wh_flow.set_max_children_per_line(4)
+        self._wh_flow.set_min_children_per_line(2)
+        self._wh_flow.set_column_spacing(10); self._wh_flow.set_row_spacing(10)
+        self._wh_flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        scroll.add(self._wh_flow)
+        page.pack_start(scroll, True, True, 0)
+
+        # Bottom bar
+        bot = Gtk.Box(spacing=10)
+        self._wh_status = Gtk.Label(label="Search for wallpapers above")
+        self._wh_status.set_halign(Gtk.Align.START); self._wh_status.set_name("mono-lbl")
+        dl_set_btn = Gtk.Button(label="󰇚 Download & Set"); dl_set_btn.set_name("btn-blue")
+        dl_set_btn.connect("clicked", self._wh_download_set)
+        gen_btn2   = Gtk.Button(label="󰏘 Generate Theme")
+        gen_btn2.connect("clicked", self._gen_theme_wh)
+        bot.pack_start(self._wh_status, True,  True,  0)
+        bot.pack_start(gen_btn2,        False, False, 0)
+        bot.pack_start(dl_set_btn,      False, False, 0)
+        page.pack_start(bot, False, False, 0)
+        return page
+
+    def _wh_search_go(self, _=None):
+        q = self._wh_entry.get_text().strip()
+        if not q: return
+        self._wh_status.set_text(f"Searching for '{q}'…")
+        for c in self._wh_flow.get_children(): self._wh_flow.remove(c)
+        sort = self._wh_sort.get_active_text() or "relevance"
+        def _search():
+            results = _wh_search(q, sorting=sort)
+            self._current_results = results
+            GLib.idle_add(lambda: (
+                self._wh_status.set_text(f"{len(results)} results"),
+                [GLib.idle_add(self._add_wh_thumb, r) for r in results[:24]],
+                False))
+        threading.Thread(target=_search, daemon=True).start()
+
+    def _add_wh_thumb(self, result):
+        wh_id     = result.get("id","")
+        thumb_url = result.get("thumbs",{}).get("small","")
+        full_url  = result.get("path","")
+        res       = result.get("resolution","")
+        def _fetch():
+            path = _wh_download(thumb_url, full_url, wh_id)
+            if path:
+                GLib.idle_add(self._add_wh_thumb_widget, path, full_url, wh_id, res)
+        threading.Thread(target=_fetch, daemon=True).start()
+        return False
+
+    def _add_wh_thumb_widget(self, thumb_path, full_url, wh_id, res):
+        try:
+            pb   = GdkPixbuf.Pixbuf.new_from_file_at_scale(thumb_path, 220, 124, True)
+            img  = Gtk.Image.new_from_pixbuf(pb)
+            btn  = Gtk.Button(); btn.set_name("thumb-btn")
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            vbox.pack_start(img, False, False, 0)
+            lbl = Gtk.Label(label=res); lbl.set_name("thumb-lbl")
+            vbox.pack_start(lbl, False, False, 0)
+            btn.add(vbox)
+            btn.connect("clicked", lambda _, u=full_url, i=wh_id, t=thumb_path:
+                        self._wh_select(u, i, t))
+            self._wh_flow.add(btn); self._wh_flow.show_all()
+        except Exception as e:
+            print(f"[wallhaven] widget failed: {e}")
+        return False
+
+    def _wh_select(self, full_url, wh_id, thumb_path):
+        self._selected_path   = thumb_path   # use thumb for theme gen preview
+        self._selected_wh_url = full_url
+        self._selected_wh_id  = wh_id
+        self._selected_source = "wallhaven"
+        self._wh_status.set_text(f"Selected: {wh_id}  ({full_url.rsplit('/',1)[-1]})")
+
+    def _wh_download_set(self, _):
+        url  = getattr(self,"_selected_wh_url", None)
+        wid  = getattr(self,"_selected_wh_id",  None)
+        if not url:
+            self._wh_status.set_text("Select a wallpaper first")
+            return
+        self._wh_status.set_text("Downloading…")
+        def _dl():
+            path = _wh_download_full(url, wid)
+            if path:
+                ok, msg = set_wallpaper(path)
+                GLib.idle_add(lambda: (self._wh_status.set_markup(
+                    f"<span foreground='{'#a6e3a1' if ok else '#f38ba8'}'>{'✓' if ok else '✗'} {msg}</span>"), False))
+                self._selected_path = path
+            else:
+                GLib.idle_add(lambda: (self._wh_status.set_markup(
+                    "<span foreground='#f38ba8'>✗ Download failed</span>"), False))
+        threading.Thread(target=_dl, daemon=True).start()
+
+    def _gen_theme_wh(self, _):
+        path = getattr(self,"_selected_path", None)
+        if not path:
+            self._wh_status.set_text("Select a wallpaper first")
+            return
+        self._wh_status.set_text("Generating theme from wallpaper colours…")
+        def _do():
+            theme, msg = generate_theme_from_wallpaper(path, "wallpaper")
+            GLib.idle_add(lambda: (self._wh_status.set_markup(
+                f"<span foreground='{'#a6e3a1' if theme else '#f38ba8'}'>{'✓' if theme else '✗'} {msg}</span>"), False))
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Style ─────────────────────────────────────────────────────────────────
+    def _apply_style(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+            #wm-root  {{ background-color: #11111b; }}
+            #wm-header{{ background-color: #0d0d17;
+                         border-bottom: 1px solid #1e1e2e; }}
+            #wm-nb    {{ background-color: #11111b; }}
+            notebook > header {{
+                background-color: #0d0d17;
+                border-bottom: 1px solid #1e1e2e;
+                padding: 6px 10px 0;
+            }}
+            notebook > header tab {{
+                background-color: transparent; color: #585b70;
+                font-family: 'JetBrainsMono Nerd Font';
+                font-size: 13px; font-weight: bold;
+                padding: 10px 18px; border-radius: 8px 8px 0 0;
+            }}
+            notebook > header tab:checked {{
+                background-color: #1e1e2e; color: {T.get('accent','#cba6f7')};
+                border-color: #313244;
+            }}
+            notebook > stack {{ background-color: #11111b; }}
+            #thumb-btn {{
+                background-color: #1e1e2e;
+                border: 1px solid #313244; border-radius: 10px;
+                padding: 6px;
+            }}
+            #thumb-btn:hover {{
+                background-color: #313244;
+                border-color: {T.get('accent','#cba6f7')};
+            }}
+            #thumb-lbl {{ font-size: 11px; color: #7f849c;
+                          font-family: 'JetBrainsMono Nerd Font'; }}
+            button {{
+                background-color: #1e1e2e; color: #cdd6f4;
+                border: 1px solid #313244; border-radius: 9px;
+                padding: 10px 14px; font-weight: bold;
+                font-family: 'JetBrainsMono Nerd Font';
+            }}
+            button:hover {{
+                background-color: rgba(203,166,247,0.12);
+                border-color: {T.get('accent','#cba6f7')};
+                color: {T.get('accent','#cba6f7')};
+            }}
+            #btn-blue  {{ background-color: rgba(137,180,250,0.12);
+                          border-color: #89b4fa; color: #89b4fa; }}
+            #btn-blue:hover {{ background-color: #89b4fa; color: #11111b; }}
+            #small-btn {{ background-color: #313244; color: #a6adc8;
+                          border: 1px solid #45475a; border-radius: 7px;
+                          padding: 5px 12px; font-size: 12px; font-weight: normal; }}
+            entry {{
+                background-color: #0d0d17; color: #cdd6f4;
+                border: 1px solid #313244; border-radius: 8px;
+                padding: 8px 12px; font-family: 'JetBrainsMono Nerd Font';
+            }}
+            entry:focus {{ border-color: {T.get('accent','#cba6f7')}; }}
+            * {{ font-family: 'JetBrainsMono Nerd Font', monospace; color: #cdd6f4; }}
+            scrollbar {{ background-color: transparent; min-width: 5px; }}
+            scrollbar slider {{ background-color: rgba(255,255,255,0.10);
+                                border-radius: 3px; min-height: 28px; }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+WallpaperManager(); Gtk.main()

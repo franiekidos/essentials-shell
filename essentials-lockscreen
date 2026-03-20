@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+essentials-lockscreen — Safe lock screen launcher
+
+SAFETY RULES:
+  1. Never auto-generate locker configs — broken configs lock you out.
+  2. Never suppress stderr — PAM/auth errors must be visible.
+  3. Always verify the binary exists AND has a config before calling it.
+  4. If nothing safe is available, warn and do NOT lock (better than lockout).
+
+Supported lockers (in preference order):
+  hyprlock    — requires ~/.config/hypr/hyprlock.conf to exist (YOU must create it)
+  swaylock    — works out of the box if installed with PAM support
+  waylock     — works out of the box
+  gtklock     — works out of the box
+  loginctl    — asks the session manager to lock (compositor-side)
+
+To set a preferred locker:
+  Add "locker": "swaylock"  to ~/.config/essentials/config.json
+
+Usage:
+  essentials-lockscreen              — lock with auto-detected locker
+  essentials-lockscreen --check      — print which locker would be used, then exit
+"""
+import os, sys, shutil, subprocess, json
+
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+def _load_config():
+    try:
+        with open(CONFIG_PATH) as f: return json.load(f)
+    except: return {}
+
+def _has(cmd):
+    return shutil.which(cmd) is not None
+
+def _locker_is_safe(locker):
+    """
+    Return (safe: bool, reason: str).
+    A locker is safe only if we're confident it will accept password input.
+    """
+    if locker == "hyprlock":
+        conf = os.path.expanduser("~/.config/hypr/hyprlock.conf")
+        if not os.path.exists(conf):
+            return False, (
+                "hyprlock config not found at ~/.config/hypr/hyprlock.conf\n"
+                "Create it manually first — essentials will NOT auto-generate it\n"
+                "to avoid locking you out with a broken config.\n"
+                "See: https://wiki.hyprland.org/Hypr-Ecosystem/hyprlock/"
+            )
+        # Check it has an input-field (without one you cannot type your password)
+        with open(conf) as f:
+            content = f.read()
+        if "input-field" not in content and "input_field" not in content:
+            return False, (
+                "hyprlock.conf exists but has no input-field section.\n"
+                "You would not be able to type your password.\n"
+                "Add an input-field block to ~/.config/hypr/hyprlock.conf"
+            )
+        return True, "hyprlock with existing config"
+
+    if locker == "swaylock":
+        # swaylock needs PAM — check it's setuid or has the right capabilities
+        path = shutil.which("swaylock")
+        if path:
+            import stat
+            st = os.stat(path)
+            has_suid = bool(st.st_mode & stat.S_ISUID)
+            # On some distros swaylock uses PAM without suid via capabilities
+            # We can't reliably check capabilities here, so just warn if no suid
+            if not has_suid:
+                # Still allow it — most distros set this up correctly
+                pass
+        return True, "swaylock"
+
+    if locker in ("waylock", "gtklock"):
+        return True, locker
+
+    if locker == "loginctl":
+        return True, "loginctl lock-session (compositor handles the lock)"
+
+    return False, f"Unknown locker: {locker}"
+
+
+def detect_locker():
+    """Return (locker_name, safe, reason)."""
+    cfg      = _load_config()
+    override = cfg.get("locker", "").strip()
+
+    candidates = []
+    if override:
+        candidates = [override]
+    else:
+        candidates = ["hyprlock", "swaylock", "waylock", "gtklock"]
+
+    for locker in candidates:
+        if locker == "loginctl":
+            safe, reason = _locker_is_safe("loginctl")
+            return "loginctl", safe, reason
+        if _has(locker):
+            safe, reason = _locker_is_safe(locker)
+            if safe:
+                return locker, True, reason
+            else:
+                # Found but not safe — report why and skip
+                print(f"[lockscreen] Skipping {locker}: {reason}", file=sys.stderr)
+
+    # Nothing safe found — fall back to loginctl
+    return "loginctl", True, "loginctl lock-session (no other locker found)"
+
+
+def lock(image_path=None):
+    locker, safe, reason = detect_locker()
+
+    if not safe:
+        msg = (f"No safe locker available.\n{reason}\n\n"
+               "Install swaylock, waylock, gtklock, or configure hyprlock manually.")
+        print(f"[lockscreen] ERROR: {msg}", file=sys.stderr)
+        return False, msg
+
+    cfg  = _load_config()
+    wall = image_path or cfg.get("wallpaper", "")
+
+    if locker == "loginctl":
+        result = subprocess.run(["loginctl", "lock-session"])
+        return result.returncode == 0, "loginctl lock-session"
+
+    if locker == "swaylock":
+        cmd = ["swaylock", "--show-failed-attempts"]
+        if wall and os.path.exists(wall):
+            cmd += ["--image", wall, "--scaling", "fill"]
+        else:
+            cmd += ["--color", "11111b"]
+        # Do NOT daemonize — let it stay in the foreground so PAM errors show
+        # Do NOT suppress stderr — auth failures must be visible
+        proc = subprocess.Popen(cmd)
+        return True, f"swaylock (pid {proc.pid})"
+
+    if locker == "hyprlock":
+        # hyprlock uses its own config — just launch it, no args needed
+        proc = subprocess.Popen(["hyprlock"])
+        return True, f"hyprlock (pid {proc.pid})"
+
+    if locker == "waylock":
+        cmd = ["waylock",
+               "--init-color=0x11111b",
+               "--input-color=0x313244",
+               "--fail-color=0xf38ba8"]
+        proc = subprocess.Popen(cmd)
+        return True, f"waylock (pid {proc.pid})"
+
+    if locker == "gtklock":
+        cmd = ["gtklock"]
+        if wall and os.path.exists(wall):
+            cmd += ["-b", wall]
+        proc = subprocess.Popen(cmd)
+        return True, f"gtklock (pid {proc.pid})"
+
+    return False, f"Unhandled locker: {locker}"
+
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:
+        locker, safe, reason = detect_locker()
+        print(f"Locker:  {locker}")
+        print(f"Safe:    {safe}")
+        print(f"Reason:  {reason}")
+        sys.exit(0 if safe else 1)
+
+    image = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+    ok, msg = lock(image)
+    if ok:
+        print(f"[lockscreen] {msg}")
+    else:
+        print(f"[lockscreen] FAILED: {msg}", file=sys.stderr)
+        sys.exit(1)

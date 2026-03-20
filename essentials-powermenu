@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+essentials-powermenu — Fullscreen power OSD
+Triggered from the CC or bound to a key.
+Supports: Hyprland, Niri, Sway, River, Labwc, MangoWC (any WM via loginctl/systemctl)
+"""
+import gi, os, json, subprocess, importlib.util
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, Gdk
+
+# ── Theme loader (reads active theme, never hardcodes catppuccin) ─────────────
+def _load_theme():
+    try:
+        data    = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
+        current = data.get("current", "catppuccin")
+        return data.get(current, data.get("catppuccin", {}))
+    except:
+        return {"bg": "#11111b", "accent": "#cba6f7", "text": "#cdd6f4", "radius": "14px"}
+
+T = _load_theme()
+
+# ── Compositor loader (for logout command) ────────────────────────────────────
+def _detect_wm():
+    path = os.path.expanduser("~/.local/bin/essentials-detect")
+    if os.path.exists(path):
+        try:
+            spec = importlib.util.spec_from_file_location("essentials_detect", path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod.detect().name
+        except Exception:
+            pass
+    return "generic"
+
+WM_NAME = _detect_wm()
+
+def _logout_cmd():
+    """Return the correct logout command for the running compositor."""
+    cmds = {
+        "hyprland": ["hyprctl", "dispatch", "exit"],
+        "niri":     ["niri", "msg", "action", "quit"],
+        "sway":     ["swaymsg", "exit"],
+        "river":    ["riverctl", "exit"],
+        "labwc":    ["labwc", "--exit"],
+        "mangowc":  ["mangowc", "--exit"],
+    }
+    return cmds.get(WM_NAME, ["pkill", "-u", os.environ.get("USER", os.getlogin())])
+
+
+class PowerOSD(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+        # Fill entire screen
+        for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                     GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(self, edge, True)
+
+        # Close on click outside the center card (button-press on the dim overlay)
+        self.connect("button-press-event", self._on_overlay_click)
+        self.connect("key-press-event",
+                     lambda w, e: Gtk.main_quit() if e.keyval == Gdk.KEY_Escape else None)
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        overlay = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        overlay.set_name("overlay")
+        self.add(overlay)
+
+        # Vertical centering
+        overlay.pack_start(Gtk.Box(), True, True, 0)
+
+        center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        center.set_halign(Gtk.Align.CENTER)
+        center.set_name("center-box")
+        overlay.pack_start(center, False, False, 0)
+
+        # Title
+        title = Gtk.Label()
+        title.set_markup(f"<span size='xx-large' weight='bold' foreground='{T.get('text','#cdd6f4')}'>Power</span>")
+        title.set_margin_bottom(32)
+        center.pack_start(title, False, False, 0)
+
+        # Button grid
+        grid = Gtk.Grid()
+        grid.set_column_spacing(20)
+        grid.set_row_spacing(20)
+        grid.set_column_homogeneous(True)
+
+        _lock_cmd = ["python3", os.path.expanduser("~/.local/bin/essentials-lockscreen")]
+        actions = [
+            ("󰐥", "Shutdown",  ["systemctl", "poweroff"], "pwr-shutdown"),
+            ("󰑓", "Reboot",    ["systemctl", "reboot"],   "pwr-reboot"),
+            ("󰤄", "Suspend",   ["systemctl", "suspend"],  "pwr-suspend"),
+            ("󰌾", "Lock",      _lock_cmd,                  "pwr-lock"),
+            ("󰈆", "Log Out",   _logout_cmd(),              "pwr-logout"),
+        ]
+
+        for i, (icon, label, cmd, name) in enumerate(actions):
+            btn = Gtk.Button()
+            btn.set_name(name)
+            btn.set_size_request(140, 140)
+
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            inner.set_halign(Gtk.Align.CENTER)
+            inner.set_valign(Gtk.Align.CENTER)
+
+            icon_lbl = Gtk.Label(label=icon); icon_lbl.set_name("pwr-icon")
+            name_lbl = Gtk.Label(label=label); name_lbl.set_name("pwr-label")
+
+            inner.pack_start(icon_lbl, False, False, 0)
+            inner.pack_start(name_lbl, False, False, 0)
+            btn.add(inner)
+            btn.connect("clicked", lambda w, c=cmd: [
+                subprocess.Popen(c, stderr=subprocess.DEVNULL),
+                Gtk.main_quit()])
+            grid.attach(btn, i % 2, i // 2, 1, 1)
+
+        center.pack_start(grid, False, False, 0)
+
+        # Cancel hint
+        cancel = Gtk.Label(label="Press Esc to cancel")
+        cancel.set_name("cancel-hint")
+        cancel.set_margin_top(28)
+        center.pack_start(cancel, False, False, 0)
+
+        overlay.pack_start(Gtk.Box(), True, True, 0)
+
+        self._apply_style()
+        self.show_all()
+
+    def _on_overlay_click(self, w, event):
+        """Dismiss if the user clicks the dim overlay (outside the card)."""
+        # Get the center-box allocation and check if click was outside it
+        card = None
+        for child in w.get_children():
+            if child.get_name() == "overlay":
+                for sub in child.get_children():
+                    if sub.get_name() == "center-box":
+                        card = sub; break
+        if card:
+            alloc = card.get_allocation()
+            cx, cy = alloc.x, alloc.y
+            cw, ch = alloc.width, alloc.height
+            if not (cx <= event.x <= cx + cw and cy <= event.y <= cy + ch):
+                Gtk.main_quit()
+        return False
+
+    def _apply_style(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+            /* Dim overlay */
+            #overlay {{
+                background-color: rgba(0, 0, 0, 0.7);
+            }}
+
+            /* Card container */
+            #center-box {{
+                background-color: {T.get('bg', '#11111b')};
+                border:           2px solid rgba(255,255,255,0.08);
+                border-radius:    20px;
+                padding:          40px 50px;
+            }}
+
+            /* All power buttons share base style */
+            button {{
+                background-color: rgba(255,255,255,0.05);
+                border:           1px solid rgba(255,255,255,0.08);
+                border-radius:    16px;
+                padding:          0;
+                box-shadow:       none;
+            }}
+            button:hover {{
+                background-color: rgba(255,255,255,0.12);
+                border-color:     rgba(255,255,255,0.2);
+            }}
+            button:active {{
+                background-color: rgba(255,255,255,0.18);
+            }}
+
+            /* Per-button accent on hover */
+            #pwr-shutdown:hover {{ background-color: rgba(243,139,168,0.25); border-color: #f38ba8; }}
+            #pwr-reboot:hover   {{ background-color: rgba(137,180,250,0.25); border-color: #89b4fa; }}
+            #pwr-suspend:hover  {{ background-color: rgba(249,226,175,0.25); border-color: #f9e2af; }}
+            #pwr-logout:hover   {{ background-color: rgba(166,227,161,0.25); border-color: #a6e3a1; }}
+
+            #pwr-icon {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                font-size:   42px;
+                color:       {T.get('accent', '#cba6f7')};
+            }}
+            #pwr-label {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                font-size:   13px;
+                font-weight: bold;
+                color:       {T.get('text', '#cdd6f4')};
+            }}
+            #cancel-hint {{
+                font-family: 'JetBrainsMono Nerd Font', monospace;
+                font-size:   12px;
+                color:       rgba(255,255,255,0.25);
+            }}
+            * {{ color: {T.get('text', '#cdd6f4')}; }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+PowerOSD(); Gtk.main()

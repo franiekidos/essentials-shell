@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""
+essentials-config-writer
+Shared config-file read/write helpers used by essentials-settings.
+Importable module — not run directly.
+
+Supports:
+  Hyprland  ~/.config/hypr/hyprland.conf   (keyword = value syntax)
+  Niri      ~/.config/niri/config.kdl       (KDL — block injection)
+  Sway      ~/.config/sway/config           (set / output / input lines)
+  River     ~/.config/river/init            (riverctl invocations)
+  Labwc     ~/.config/labwc/rc.xml          (XML patching)
+  MangoWC   ~/.config/mangowc/config        (key=value)
+"""
+
+import os, re, shutil, json
+from datetime import datetime
+
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+
+# ── Utility ───────────────────────────────────────────────────────────────────
+
+def _backup(path):
+    """Create a timestamped backup of a config file."""
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak = f"{path}.bak.{ts}"
+    shutil.copy2(path, bak)
+    return bak
+
+def _read(path):
+    with open(path, "r") as f:
+        return f.readlines()
+
+def _write(path, lines):
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+
+# ── Hyprland ──────────────────────────────────────────────────────────────────
+
+class HyprlandWriter:
+    """
+    Read/write hyprland.conf.
+    Each public method does: backup → mutate lines → write → return True/error_str.
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+    def _set_keyword(self, key, value):
+        """Set a top-level keyword = value. Replaces existing, appends if absent."""
+        lines   = _read(self.path)
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        new_line = f"{key} = {value}\n"
+        replaced = False
+        for i, line in enumerate(lines):
+            if pattern.match(line) and not line.strip().startswith("#"):
+                lines[i] = new_line
+                replaced  = True
+                break
+        if not replaced:
+            lines.append(f"\n{new_line}")
+        _write(self.path, lines)
+
+    def _set_nested(self, block, key, value):
+        """
+        Set key = value inside a named block (e.g. input { }).
+        Handles both single-line and multi-line blocks.
+        For colour keys (col.*) the value replaces the entire line regardless
+        of any existing gradient / angle syntax.
+        """
+        lines    = _read(self.path)
+        # Match the key anywhere in the block, including col.active_border etc.
+        pattern  = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        new_kv   = f"    {key} = {value}\n"
+
+        in_block = False
+        depth    = 0
+        replaced = False
+        block_re = re.compile(rf"^\s*{re.escape(block)}\s*{{")
+        for i, line in enumerate(lines):
+            if block_re.match(line):
+                in_block = True; depth = 1; continue
+            if in_block:
+                depth += line.count("{") - line.count("}")
+                if depth <= 0:
+                    if not replaced:
+                        lines.insert(i, new_kv)
+                    break
+                if pattern.match(line) and not line.strip().startswith("#"):
+                    lines[i] = new_kv; replaced = True
+
+        if not in_block:
+            lines.append(f"\n{block} {{\n{new_kv}}}\n")
+
+        _write(self.path, lines)
+
+    def set_border_theme(self, active_rgba, inactive_rgba, rounding):
+        """
+        Top-level helper: write active/inactive border + rounding.
+        Handles both general { } and general { ... col.active_border ... } forms.
+        Also handles Hyprland v0.40+ where col.active_border lives in
+        general { } directly.
+        """
+        _backup(self.path)
+        self._set_nested("general",    "col.active_border",   active_rgba)
+        self._set_nested("general",    "col.inactive_border", inactive_rgba)
+        self._set_nested("decoration", "rounding",            str(rounding))
+
+    # Public API ───────────────────────────────────────────────────────────────
+
+    def set_monitor(self, name, resolution, position="auto",
+                    scale=1.0, transform=0):
+        """Add/replace: monitor = name, resolution, position, scale, transform, N"""
+        _backup(self.path)
+        lines   = _read(self.path)
+        pattern = re.compile(rf"^\s*monitor\s*=\s*{re.escape(name)}\s*,")
+        new_line = (f"monitor = {name},{resolution},"
+                    f"{position},{scale},transform,{transform}\n")
+        replaced = False
+        for i, line in enumerate(lines):
+            if pattern.match(line) and not line.strip().startswith("#"):
+                lines[i] = new_line
+                replaced  = True
+                break
+        if not replaced:
+            lines.append(f"\n{new_line}")
+        _write(self.path, lines)
+        return True
+
+    def set_input(self, props: dict):
+        """
+        Write input { } block properties.
+        props: {natural_scroll, sensitivity, tap, left_handed, accel_profile, ...}
+        """
+        _backup(self.path)
+        for key, val in props.items():
+            v = ("true" if val is True else "false" if val is False
+                 else f"{val:.3f}" if isinstance(val, float) else str(val))
+            self._set_nested("input", key, v)
+        return True
+
+    def set_env(self, key, value):
+        """env = KEY, VALUE"""
+        _backup(self.path)
+        lines   = _read(self.path)
+        pattern = re.compile(rf"^\s*env\s*=\s*{re.escape(key)}\s*,")
+        new_line = f"env = {key},{value}\n"
+        replaced = False
+        for i, line in enumerate(lines):
+            if pattern.match(line) and not line.strip().startswith("#"):
+                lines[i] = new_line
+                replaced  = True
+                break
+        if not replaced:
+            lines.append(new_line)
+        _write(self.path, lines)
+        return True
+
+    def set_general(self, key, value):
+        _backup(self.path)
+        self._set_nested("general", key, str(value))
+        return True
+
+    def set_decoration(self, key, value):
+        _backup(self.path)
+        self._set_nested("decoration", key, str(value))
+        return True
+
+    def set_animation(self, key, value):
+        _backup(self.path)
+        self._set_nested("animations", key, str(value))
+        return True
+
+    def add_keybind(self, mod, key, cmd):
+        _backup(self.path)
+        lines = _read(self.path)
+        lines.append(f"bind = {mod}, {key}, {cmd}\n")
+        _write(self.path, lines)
+        return True
+
+    def remove_keybind(self, mod, key, cmd):
+        _backup(self.path)
+        lines   = _read(self.path)
+        pattern = re.compile(
+            rf"^\s*bind\s*=\s*{re.escape(mod)}\s*,\s*{re.escape(key)}\s*,\s*{re.escape(cmd)}")
+        lines   = [l for l in lines if not pattern.match(l)]
+        _write(self.path, lines)
+        return True
+
+    def rewrite_keybinds(self, binds, other_lines):
+        """Replace all bind lines with `binds` list of (mod, key, cmd) tuples."""
+        _backup(self.path)
+        out = list(other_lines)
+        for mod, key, cmd in binds:
+            out.append(f"bind = {mod}, {key}, {cmd}\n")
+        _write(self.path, out)
+        return True
+
+
+# ── Sway ──────────────────────────────────────────────────────────────────────
+
+class SwayWriter:
+    def __init__(self, path):
+        self.path = path
+
+    def _set_line(self, pattern_re, new_line):
+        lines    = _read(self.path)
+        replaced = False
+        for i, line in enumerate(lines):
+            if re.match(pattern_re, line) and not line.strip().startswith("#"):
+                lines[i] = new_line
+                replaced  = True
+                break
+        if not replaced:
+            lines.append(f"\n{new_line}")
+        _write(self.path, lines)
+
+    def set_monitor(self, name, resolution, position="auto", scale=1.0, transform=0):
+        _backup(self.path)
+        res = resolution.split("@")[0]
+        rr  = resolution.split("@")[1].replace("Hz","") if "@" in resolution else ""
+        parts = ["output", name, "resolution", res]
+        if rr: parts += ["refresh", rr]
+        parts += ["position", position, "scale", str(scale)]
+        self._set_line(rf"^\s*output\s+{re.escape(name)}\s+",
+                       " ".join(parts) + "\n")
+        return True
+
+    def set_input(self, identifier, props: dict):
+        _backup(self.path)
+        lines = _read(self.path)
+        prop_map = {
+            "natural_scroll": lambda v: "natural_scroll " + ("enabled" if v else "disabled"),
+            "sensitivity":    lambda v: f"accel_speed {v:.3f}",
+            "pointer_speed":  lambda v: f"accel_speed {v:.3f}",
+            "tap":            lambda v: "tap " + ("enabled" if v else "disabled"),
+            "left_handed":    lambda v: "left_handed " + ("enabled" if v else "disabled"),
+        }
+        # Remove old input block for this identifier
+        out, skip, depth = [], False, 0
+        id_re = re.compile(rf"^\s*input\s+\"{re.escape(identifier)}\"")
+        for line in lines:
+            if id_re.match(line):
+                skip  = True
+                depth = 1
+                continue
+            if skip:
+                depth += line.count("{") - line.count("}")
+                if depth <= 0: skip = False
+                continue
+            out.append(line)
+        # Append new block
+        out.append(f'\ninput "{identifier}" {{\n')
+        for key, val in props.items():
+            if key in prop_map:
+                out.append(f"    {prop_map[key](val)}\n")
+        out.append("}\n")
+        _write(self.path, out)
+        return True
+
+    def rewrite_keybinds(self, binds, other_lines):
+        _backup(self.path)
+        out = list(other_lines)
+        for mod, key, cmd in binds:
+            out.append(f"bindsym {mod}+{key} {cmd}\n")
+        _write(self.path, out)
+        return True
+
+
+# ── River ─────────────────────────────────────────────────────────────────────
+
+class RiverWriter:
+    def __init__(self, path):
+        self.path = path
+
+    def set_input(self, identifier, props: dict):
+        _backup(self.path)
+        lines = _read(self.path)
+        prop_map = {
+            "natural_scroll": lambda v: f"riverctl input {identifier} natural-scroll {'enabled' if v else 'disabled'}",
+            "pointer_speed":  lambda v: f"riverctl input {identifier} pointer-accel {v:.3f}",
+            "tap":            lambda v: f"riverctl input {identifier} tap {'enabled' if v else 'disabled'}",
+            "left_handed":    lambda v: f"riverctl input {identifier} left-handed {'enabled' if v else 'disabled'}",
+        }
+        for key, val in props.items():
+            if key not in prop_map: continue
+            new_line = prop_map[key](val) + "\n"
+            pat = re.compile(rf"riverctl input {re.escape(identifier)} "
+                             rf"{key.replace('_','-')}")
+            replaced = False
+            for i, line in enumerate(lines):
+                if pat.search(line):
+                    lines[i] = new_line; replaced = True; break
+            if not replaced:
+                lines.append(new_line)
+        _write(self.path, lines)
+        return True
+
+    def rewrite_keybinds(self, binds, other_lines):
+        _backup(self.path)
+        out = list(other_lines)
+        for mod, key, cmd in binds:
+            out.append(f"riverctl map normal {mod} {key} {cmd}\n")
+        _write(self.path, out)
+        return True
+
+
+# ── Generic / MangoWC ─────────────────────────────────────────────────────────
+
+class GenericWriter:
+    """key=value file writer for MangoWC and unknown compositors."""
+    def __init__(self, path):
+        self.path = path
+
+    def set(self, key, value):
+        if not self.path or not os.path.exists(self.path): return False
+        _backup(self.path)
+        lines   = _read(self.path)
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        new_line = f"{key}={value}\n"
+        replaced = False
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                lines[i] = new_line; replaced = True; break
+        if not replaced:
+            lines.append(new_line)
+        _write(self.path, lines)
+        return True
+
+
+# ── WM border/decoration theming ──────────────────────────────────────────────
+
+def _parse_accent(raw):
+    """Return (r, g, b) 0-255 ints from #rrggbb or rgba(...)."""
+    import re as _re
+    raw = raw.strip()
+    m = _re.match(r"#([0-9a-fA-F]{6})", raw)
+    if m:
+        h = m.group(1)
+        return int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    m = _re.match(r"rgba?\(([0-9]+),\s*([0-9]+),\s*([0-9]+)", raw)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return 203, 166, 247   # catppuccin fallback
+
+def _dim(r, g, b, factor=0.35):
+    """Return a dimmer/desaturated version of a colour as #rrggbb."""
+    import colorsys
+    h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+    r2,g2,b2 = colorsys.hsv_to_rgb(h, s*0.4, v*factor)
+    return "#{:02x}{:02x}{:02x}".format(int(r2*255),int(g2*255),int(b2*255))
+
+def _hex(r, g, b):
+    return "#{:02x}{:02x}{:02x}".format(r, g, b)
+
+def apply_wm_theme(wm_name, config_path, theme):
+    """
+    Apply window border / decoration colours from *theme* to the compositor.
+    theme  = dict with at least "accent", optionally "bg", "text", "radius".
+    Returns (ok: bool, message: str).
+
+    What each compositor gets:
+      Hyprland  — general.col.active_border, col.inactive_border
+                  decoration.rounding (from theme radius)
+      Sway      — client.focused / unfocused / urgent border colours
+      River     — riverctl border-color-focused / unfocused
+      Niri      — (live IPC not available; writes config, needs reload)
+      Labwc     — (writes rc.xml <theme> block)
+      MangoWC   — key=value border colours
+    """
+    raw_accent = theme.get("accent", "#cba6f7")
+    raw_bg     = theme.get("bg",     "rgba(30,30,46,0.92)")
+    raw_text   = theme.get("text",   "#cdd6f4")
+    radius_str = theme.get("radius", "8px")
+
+    ar, ag, ab   = _parse_accent(raw_accent)
+    accent_hex   = _hex(ar, ag, ab)
+    inactive_hex = _dim(ar, ag, ab, factor=0.25)
+
+    # Border radius — strip "px", clamp 0-20
+    try:    rounding = min(20, max(0, int(radius_str.replace("px","").strip())))
+    except: rounding = 8
+
+    import subprocess, shutil
+
+    if wm_name == "hyprland":
+        # Hyprland rgba format: rgba(rrggbbaa) — no spaces, no commas
+        active_rgba   = f"rgba({ar:02x}{ag:02x}{ab:02x}ff)"
+        inactive_rgba = f"rgba({inactive_hex[1:]}ff)"
+
+        def _hypr_keyword(key, value):
+            """
+            Run hyprctl keyword, check stdout for "ok".
+            Returns (success, output).
+            hyprctl exits 0 even on bad keywords, so check stdout.
+            """
+            try:
+                r = subprocess.run(
+                    ["hyprctl", "keyword", key, value],
+                    capture_output=True, text=True)
+                out = r.stdout.strip().lower()
+                # hyprctl prints "ok" on success
+                ok = r.returncode == 0 and ("ok" in out or out == "")
+                return ok, r.stdout.strip() or r.stderr.strip()
+            except FileNotFoundError:
+                return False, "hyprctl not found"
+            except Exception as e:
+                return False, str(e)
+
+        errors = []
+        # Try both keyword formats — Hyprland changed the separator in v0.42
+        for key, val in [
+            ("general:col.active_border",   active_rgba),
+            ("general:col.inactive_border", inactive_rgba),
+            ("decoration:rounding",         str(rounding)),
+        ]:
+            ok, msg = _hypr_keyword(key, val)
+            if not ok:
+                # Try dot-notation fallback
+                fallback_key = key.replace(":", ".")
+                ok2, msg2 = _hypr_keyword(fallback_key, val)
+                if not ok2:
+                    errors.append(f"{key}: {msg} / {fallback_key}: {msg2}")
+
+        # Persist to config file so borders survive Hyprland restart
+        if config_path and os.path.exists(config_path):
+            try:
+                w = HyprlandWriter(config_path)
+                w.set_border_theme(active_rgba, inactive_rgba, rounding)
+            except Exception as e:
+                errors.append(f"config write: {e}")
+
+        return (not errors,
+                f"Applied Hyprland borders (accent={active_rgba}, rounding={rounding})"
+                if not errors else f"Partial: {'; '.join(errors)}")
+
+    elif wm_name == "sway":
+        # client.focused <border> <background> <text> <indicator> <child_border>
+        # Apply live via swaymsg
+        cmds = [
+            ["swaymsg","client.focused",
+             accent_hex, raw_bg, raw_text, accent_hex, accent_hex],
+            ["swaymsg","client.unfocused",
+             inactive_hex, raw_bg, raw_text, inactive_hex, inactive_hex],
+            ["swaymsg","client.urgent",
+             "#f38ba8", raw_bg, raw_text, "#f38ba8", "#f38ba8"],
+        ]
+        errors = []
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                errors.append(f"{cmd[1]}: {r.stderr.strip() or r.stdout.strip()}")
+        # Persist to config
+        if config_path and os.path.exists(config_path):
+            try:
+                lines = _read(config_path)
+                import re as _re
+                new_lines = [l for l in lines
+                             if not _re.match(r"\s*client\.(focused|unfocused|urgent)", l)]
+                new_lines += [
+                    f"client.focused         {accent_hex} {raw_bg} {raw_text} {accent_hex} {accent_hex}\n",
+                    f"client.unfocused       {inactive_hex} {raw_bg} {raw_text} {inactive_hex} {inactive_hex}\n",
+                    f"client.urgent          #f38ba8 {raw_bg} {raw_text} #f38ba8 #f38ba8\n",
+                ]
+                _write(config_path, new_lines)
+            except Exception as e:
+                errors.append(f"config: {e}")
+        return (not errors,
+                "Applied Sway borders" if not errors
+                else f"Partial: {'; '.join(errors)}")
+
+    elif wm_name == "river":
+        cmds = [
+            ["riverctl","border-color-focused",   accent_hex.lstrip("#")],
+            ["riverctl","border-color-unfocused",  inactive_hex.lstrip("#")],
+            ["riverctl","border-color-urgent",     "f38ba8"],
+        ]
+        errors = []
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                errors.append(f"{cmd[1]}: {r.stderr.strip() or r.stdout.strip()}")
+        # Also append/update init script
+        if config_path and os.path.exists(config_path):
+            try:
+                lines = _read(config_path)
+                import re as _re
+                lines = [l for l in lines
+                         if not _re.match(r"riverctl border-color-", l.strip())]
+                lines += [
+                    f"riverctl border-color-focused   {accent_hex.lstrip('#')}\n",
+                    f"riverctl border-color-unfocused  {inactive_hex.lstrip('#')}\n",
+                ]
+                _write(config_path, lines)
+            except Exception as e:
+                errors.append(f"config: {e}")
+        return (not errors,
+                "Applied River borders" if not errors
+                else f"Partial: {'; '.join(errors)}")
+
+    elif wm_name == "labwc":
+        # labwc rc.xml — update/insert <theme> section
+        if not config_path or not os.path.exists(config_path):
+            return False, "labwc rc.xml not found"
+        try:
+            _backup(config_path)
+            with open(config_path) as f: xml = f.read()
+            import re as _re
+            # Simple injection — replace or append <theme> block
+            theme_block = (
+                f"  <theme>\n"
+                f"    <name>essentials</name>\n"
+                f"    <cornerradius>{rounding}</cornerradius>\n"
+                f"    <window><border><width>2</width></border></window>\n"
+                f"  </theme>\n"
+            )
+            if "<theme>" in xml:
+                xml = _re.sub(r"<theme>.*?</theme>", theme_block.strip(),
+                              xml, flags=_re.DOTALL)
+            else:
+                xml = xml.replace("</openbox_config>",
+                                  theme_block + "</openbox_config>")
+            with open(config_path,"w") as f: f.write(xml)
+            # Signal labwc to reconfigure
+            subprocess.run(["labwc","--reconfigure"], stderr=subprocess.DEVNULL)
+            return True, "Applied Labwc theme"
+        except Exception as e:
+            return False, str(e)
+
+    elif wm_name in ("mangowc","generic"):
+        if not config_path or not os.path.exists(config_path):
+            return False, f"{wm_name} config not found"
+        try:
+            w = GenericWriter(config_path)
+            w.set("border_color",          accent_hex)
+            w.set("border_color_inactive",  inactive_hex)
+            w.set("border_radius",          str(rounding))
+            return True, f"Applied {wm_name} borders"
+        except Exception as e:
+            return False, str(e)
+
+    return False, f"Border theming not supported for {wm_name}"
+
+
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+def get_writer(wm_name: str, config_path: str | None):
+    """Return the right writer for the given compositor."""
+    if wm_name == "hyprland" and config_path:
+        return HyprlandWriter(config_path)
+    if wm_name == "sway" and config_path:
+        return SwayWriter(config_path)
+    if wm_name == "river" and config_path:
+        return RiverWriter(config_path)
+    if config_path:
+        return GenericWriter(config_path)
+    return None
+
+
+# ── Bar layout config helpers ─────────────────────────────────────────────────
+
+DEFAULT_LAYOUT = {
+    "left":   ["launcher", "wm-badge", "workspaces"],
+    "center": ["media", "clock"],
+    "right":  ["network", "cpu", "ram", "cc-button"],
+}
+
+ALL_WIDGETS = {
+    "launcher":   "󰣇  App Launcher",
+    "wm-badge":   "󰖲  WM Badge",
+    "workspaces": "󰮯  Workspaces",
+    "clock":      "󰥔  Clock",
+    "media":      "󰝚  Media Title",
+    "cpu":        "󰍛  CPU %",
+    "ram":        "󰘚  RAM %",
+    "network":    "󰖩  Network",
+    "temp":       "󰔏  Temperature",
+    "disk":       "󰋊  Disk %",
+    "cc-button":  "󰒓  CC Button",
+    "power-button": "󰐥  Power Button",
+    "tray":       "󱊔  System Tray",
+    "updates":    "󰚰  Updates",
+    "battery":    "󰁹  Battery",
+    "separator":  "│  Separator",
+}
+
+def load_bar_layout():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("bar", DEFAULT_LAYOUT)
+    except:
+        return DEFAULT_LAYOUT.copy()
+
+def save_bar_layout(layout: dict):
+    data = {}
+    try:
+        with open(CONFIG_PATH) as f: data = json.load(f)
+    except: pass
+    data["bar"] = layout
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f, indent=4)

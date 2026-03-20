@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import gi, os, json, subprocess
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, Gdk, Gio
+
+def _load_theme():
+    try:
+        data    = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
+        current = data.get("current", "catppuccin")
+        return data.get(current, data.get("catppuccin", {}))
+    except:
+        return {"bg":"rgba(17,17,27,0.92)","accent":"#cba6f7","text":"#cdd6f4","radius":"12px"}
+
+t = _load_theme()
+
+class Launcher(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+        for edge in [GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                     GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT]:
+            GtkLayerShell.set_anchor(self, edge, False)
+
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(main_vbox)
+
+        # Search bar
+        search_wrap = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        search_wrap.set_name("search-wrap")
+        search_wrap.set_margin_start(18); search_wrap.set_margin_end(18)
+        search_wrap.set_margin_top(18);   search_wrap.set_margin_bottom(12)
+
+        icon = Gtk.Label(label="󰍉"); icon.set_name("search-icon")
+        self.entry = Gtk.Entry(placeholder_text="Search applications…")
+        self.entry.set_name("search-entry")
+        self.entry.set_hexpand(True)
+        self.entry.connect("changed", self.on_search)
+        self.entry.connect("activate", self.on_enter)
+
+        search_wrap.pack_start(icon,       False, False,  0)
+        search_wrap.pack_start(self.entry, True,  True,  10)
+        main_vbox.pack_start(search_wrap, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_name("sep")
+        main_vbox.pack_start(sep, False, False, 0)
+
+        # App grid
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(400)
+        scroll.set_min_content_width(560)
+
+        self.flow = Gtk.FlowBox()
+        self.flow.set_name("app-flow")
+        self.flow.set_max_children_per_line(5)
+        self.flow.set_min_children_per_line(3)
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_column_spacing(6)
+        self.flow.set_row_spacing(6)
+        self.flow.set_margin_start(14); self.flow.set_margin_end(14)
+        self.flow.set_margin_top(10);   self.flow.set_margin_bottom(14)
+        self.flow.set_homogeneous(True)
+        scroll.add(self.flow)
+        main_vbox.pack_start(scroll, True, True, 0)
+
+        self.apps = self.get_apps()
+        self.update_grid("")
+        self.show_all()
+        self.entry.grab_focus()
+        self.connect("key-press-event",
+                     lambda w, e: Gtk.main_quit() if e.keyval == Gdk.KEY_Escape else None)
+
+    def get_apps(self):
+        return sorted(
+            [{"name": a.get_name(), "exec": a.get_commandline(), "icon": a.get_icon()}
+             for a in Gio.AppInfo.get_all() if a.should_show() and a.get_commandline()],
+            key=lambda a: a["name"].lower()
+        )
+
+    def update_grid(self, q):
+        for c in self.flow.get_children():
+            self.flow.remove(c)
+        for a in self.apps:
+            if q.lower() not in a["name"].lower():
+                continue
+            btn = Gtk.Button(); btn.set_name("app-item")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            inner.set_margin_top(12); inner.set_margin_bottom(12)
+            inner.set_margin_start(8); inner.set_margin_end(8)
+            img = Gtk.Image(); img.set_pixel_size(48)
+            if a["icon"]: img.set_from_gicon(a["icon"], Gtk.IconSize.DIALOG)
+            else: img.set_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
+            name = a["name"]
+            lbl  = Gtk.Label(label=name if len(name) <= 14 else name[:13] + "…")
+            lbl.set_name("app-label")
+            inner.pack_start(img, False, False, 0)
+            inner.pack_start(lbl, False, False, 0)
+            btn.add(inner)
+            btn.connect("clicked", lambda w, c=a["exec"]: [subprocess.Popen(c.split()), Gtk.main_quit()])
+            self.flow.add(btn)
+        self.flow.show_all()
+
+    def on_search(self, e): self.update_grid(e.get_text())
+    def on_enter(self, e):
+        children = self.flow.get_children()
+        if children: children[0].get_child().clicked()
+
+
+style = Gtk.CssProvider()
+style.load_from_data(f"""
+    window {{
+        background:    {t['bg']};
+        border:        2px solid {t['accent']};
+        border-radius: {t['radius']};
+    }}
+    #search-wrap {{
+        background: rgba(0,0,0,0.15);
+    }}
+    #search-icon {{
+        color: {t['accent']};
+        font-size: 20px;
+        margin: 0 4px;
+    }}
+    #search-entry {{
+        background:    rgba(255,255,255,0.07);
+        color:         {t['text']};
+        font-family:   'JetBrainsMono Nerd Font';
+        font-size:     16px;
+        border:        1px solid rgba(255,255,255,0.1);
+        border-radius: 10px;
+        padding:       10px 14px;
+    }}
+    #search-entry:focus {{
+        border-color: {t['accent']};
+        background:   rgba(255,255,255,0.10);
+    }}
+    #sep {{
+        background: rgba(255,255,255,0.07);
+        min-height: 1px;
+    }}
+    #app-item {{
+        background:    rgba(255,255,255,0.04);
+        border:        1px solid rgba(255,255,255,0.06);
+        border-radius: 12px;
+        padding:       0;
+        min-width:     96px;
+    }}
+    #app-item:hover {{
+        background:   rgba(203,166,247,0.12);
+        border-color: {t['accent']};
+    }}
+    #app-item:active {{
+        background: rgba(203,166,247,0.22);
+    }}
+    #app-label {{
+        color:       {t['text']};
+        font-family: 'JetBrainsMono Nerd Font';
+        font-size:   11px;
+    }}
+    scrollbar {{ background: transparent; min-width: 6px; }}
+    scrollbar slider {{
+        background:    rgba(255,255,255,0.15);
+        border-radius: 3px;
+        min-height:    30px;
+    }}
+    scrollbar slider:hover {{ background: {t['accent']}; }}
+""".encode())
+
+Gtk.StyleContext.add_provider_for_screen(
+    Gdk.Screen.get_default(), style, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+)
+Launcher(); Gtk.main()

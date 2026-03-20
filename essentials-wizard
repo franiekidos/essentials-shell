@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+essentials-wizard — First-time setup wizard
+
+Walks through:
+  1. Compositor detection confirmation
+  2. Theme selection
+  3. Wallpaper setup
+  4. Optional tools check
+  5. Bar style selection
+  6. Autostart configuration
+"""
+import gi, os, json, shutil, subprocess, importlib.util
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, Gdk
+
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+THEME_PATH  = os.path.expanduser("~/.config/essentials/themes.json")
+BIN         = os.path.expanduser("~/.local/bin")
+DONE_FLAG   = os.path.expanduser("~/.config/essentials/.wizard_done")
+
+def _has(cmd): return shutil.which(cmd) is not None
+
+def _load_wm():
+    path = os.path.expanduser("~/.local/bin/essentials-detect")
+    if os.path.exists(path):
+        try:
+            spec = importlib.util.spec_from_file_location("essentials_detect", path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+                return mod.detect()
+        except: pass
+    class _FB:
+        name = "generic"
+        def get_config_path(self): return None
+    return _FB()
+
+WM = _load_wm()
+
+def _save_config(updates):
+    data = {}
+    try:
+        with open(CONFIG_PATH) as f: data = json.load(f)
+    except: pass
+    data.update(updates)
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+
+class Wizard(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+
+        self._page = 0
+        self._selections = {}
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_name("wiz-root"); self.add(root)
+
+        # Progress bar
+        self._progress = Gtk.ProgressBar(); self._progress.set_name("wiz-progress")
+        root.pack_start(self._progress, False, False, 0)
+
+        # Content area (swapped per page)
+        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._content.set_name("wiz-content")
+        self._content.set_margin_start(50); self._content.set_margin_end(50)
+        self._content.set_margin_top(40);   self._content.set_margin_bottom(30)
+        root.pack_start(self._content, True, True, 0)
+
+        # Nav buttons
+        nav = Gtk.Box(spacing=14)
+        nav.set_margin_start(50); nav.set_margin_end(50); nav.set_margin_bottom(30)
+        self._back_btn = Gtk.Button(label="← Back"); self._back_btn.set_name("nav-btn")
+        self._back_btn.connect("clicked", lambda _: self._go(-1))
+        self._next_btn = Gtk.Button(label="Next →"); self._next_btn.set_name("nav-btn-primary")
+        self._next_btn.connect("clicked", lambda _: self._go(1))
+        nav.pack_start(self._back_btn, False, False, 0)
+        nav.pack_end(self._next_btn,   False, False, 0)
+        root.pack_start(nav, False, False, 0)
+
+        self._pages = [
+            self._page_welcome,
+            self._page_compositor,
+            self._page_theme,
+            self._page_bar_style,
+            self._page_widgets,
+            self._page_tools,
+            self._page_finish,
+        ]
+        self._render_page()
+        self._apply_style()
+        self.set_size_request(740, 520)
+        self.show_all()
+
+    def _go(self, direction):
+        # Collect from current page
+        collector = getattr(self, f"_collect_{self._page}", None)
+        if collector: collector()
+        self._page = max(0, min(self._page + direction, len(self._pages)-1))
+        self._render_page()
+
+    def _render_page(self):
+        for c in self._content.get_children(): self._content.remove(c)
+        self._pages[self._page]()
+        self._progress.set_fraction((self._page+1) / len(self._pages))
+        self._back_btn.set_sensitive(self._page > 0)
+        last = self._page == len(self._pages) - 1
+        self._next_btn.set_label("Finish 🎉" if last else "Next →")
+        self._content.show_all()
+
+    def _heading(self, text, sub=""):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        h = Gtk.Label(); h.set_markup(f"<span size='xx-large' weight='bold'>{text}</span>")
+        h.set_halign(Gtk.Align.START); box.pack_start(h, False, False, 0)
+        if sub:
+            s = Gtk.Label(label=sub); s.set_name("wiz-sub")
+            s.set_halign(Gtk.Align.START); s.set_line_wrap(True)
+            box.pack_start(s, False, False, 0)
+        self._content.pack_start(box, False, False, 0)
+        self._content.pack_start(Gtk.Separator(), False, False, 12)
+
+    # ── Pages ─────────────────────────────────────────────────────────────────
+    def _page_welcome(self):
+        self._heading("Welcome to Essentials Shell 🎉",
+            "Let's get everything configured in a few quick steps.")
+        lbl = Gtk.Label(label=(
+            "This wizard will help you:\n"
+            "  • Confirm your compositor\n"
+            "  • Pick a colour theme\n"
+            "  • Choose a bar style\n"
+            "  • Check optional tools\n\n"
+            "You can re-run this wizard anytime from Settings."
+        ))
+        lbl.set_halign(Gtk.Align.START); lbl.set_name("wiz-body")
+        self._content.pack_start(lbl, False, False, 0)
+
+    def _page_compositor(self):
+        self._heading("Compositor Detected",
+            f"Found: {WM.name.upper()}  —  correct?")
+        wm_lbl = Gtk.Label()
+        wm_lbl.set_markup(
+            f"<span size='x-large' weight='bold' "
+            f"foreground='#cba6f7'>{WM.name.upper()}</span>")
+        wm_lbl.set_halign(Gtk.Align.START)
+        self._content.pack_start(wm_lbl, False, False, 0)
+        conf = WM.get_config_path()
+        if conf:
+            p = Gtk.Label(label=f"Config: {conf}")
+            p.set_name("wiz-sub"); p.set_halign(Gtk.Align.START)
+            self._content.pack_start(p, False, False, 4)
+        note = Gtk.Label(label="If this is wrong, check that your compositor sets\n"
+                                "HYPRLAND_INSTANCE_SIGNATURE / NIRI_SOCKET / SWAYSOCK.")
+        note.set_name("wiz-sub"); note.set_halign(Gtk.Align.START)
+        self._content.pack_start(note, False, False, 8)
+
+    def _page_theme(self):
+        self._heading("Choose a Theme", "Select a colour scheme for the shell.")
+        try:
+            data = json.load(open(THEME_PATH))
+            current = data.get("current","catppuccin")
+            themes  = [k for k in data if k != "current"]
+        except:
+            data, current, themes = {}, "catppuccin", ["catppuccin"]
+
+        self._theme_btns = {}
+        flow = Gtk.FlowBox(); flow.set_max_children_per_line(3)
+        flow.set_column_spacing(10); flow.set_row_spacing(10)
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+
+        for name in themes:
+            t   = data.get(name,{})
+            btn = Gtk.ToggleButton(label=name.capitalize())
+            btn.set_active(name == current)
+            btn.set_name("theme-btn-active" if name == current else "theme-btn")
+            btn.connect("clicked", self._on_theme_pick, name)
+            self._theme_btns[name] = btn
+            flow.add(btn)
+        self._content.pack_start(flow, False, False, 0)
+        self._selections["theme"] = current
+
+    def _on_theme_pick(self, btn, name):
+        if getattr(self,"_theme_lock",False): return
+        if not btn.get_active(): self._theme_lock=True; btn.set_active(True); self._theme_lock=False; return
+        self._theme_lock = True
+        for n, b in self._theme_btns.items():
+            b.set_active(n == name)
+            b.set_name("theme-btn-active" if n == name else "theme-btn")
+        self._theme_lock = False
+        self._selections["theme"] = name
+
+    def _collect_2(self):  # theme page is index 2
+        name = self._selections.get("theme","catppuccin")
+        try:
+            with open(THEME_PATH) as f: data = json.load(f)
+            data["current"] = name
+            with open(THEME_PATH,"w") as f: json.dump(data,f,indent=4)
+        except: pass
+
+    def _page_bar_style(self):
+        self._heading("Bar Style",
+            "Choose how the bar looks on screen.")
+        styles = {
+            "trilands": ("Trilands",  "Three floating pills (default)"),
+            "islands":  ("Islands",   "Single compact centered pill"),
+            "still":    ("Still",     "Classic full-width flat bar"),
+            "floating": ("Floating",  "Wide floating bar with margins"),
+            "blocks":   ("Blocks",    "Rectangular blocks at the bottom"),
+        }
+        current = self._selections.get("bar_style", "trilands")
+        self._style_btns = {}
+        flow = Gtk.FlowBox(); flow.set_max_children_per_line(3)
+        flow.set_column_spacing(10); flow.set_row_spacing(10)
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        for sid,(label,desc) in styles.items():
+            btn = Gtk.ToggleButton()
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            inner.pack_start(Gtk.Label(label=label), False, False, 0)
+            sub = Gtk.Label(label=desc); sub.set_name("wiz-sub")
+            inner.pack_start(sub, False, False, 0)
+            btn.add(inner); btn.set_active(sid == current)
+            btn.set_name("theme-btn-active" if sid == current else "theme-btn")
+            btn.set_tooltip_text(desc)
+            btn.connect("clicked", self._on_style_pick, sid)
+            self._style_btns[sid] = btn; flow.add(btn)
+        self._content.pack_start(flow, False, False, 0)
+
+    def _on_style_pick(self, btn, sid):
+        if getattr(self,"_style_lock",False): return
+        if not btn.get_active(): self._style_lock=True; btn.set_active(True); self._style_lock=False; return
+        self._style_lock = True
+        for s, b in self._style_btns.items():
+            b.set_active(s == sid)
+            b.set_name("theme-btn-active" if s == sid else "theme-btn")
+        self._style_lock = False
+        self._selections["bar_style"] = sid
+
+    def _collect_3(self):
+        _save_config({"bar_style": self._selections.get("bar_style","trilands")})
+
+    def _page_widgets(self):
+        self._heading("Desktop Widgets",
+            "Choose which widgets to show on your desktop.")
+        widgets = [
+            ("clock",   "󰥔  Clock",   "Large time + date overlay"),
+            ("sysinfo", "󰍛  Sysinfo", "CPU / RAM / Disk / Temp"),
+            ("media",   "󰝚  Media",   "Now playing + controls"),
+        ]
+        self._widget_cbs = {}
+        for wname, icon, desc in widgets:
+            row = Gtk.Box(spacing=12); row.set_name("theme-row")
+            lbl = Gtk.Label(label=f"{icon} — {desc}"); lbl.set_name("theme-text")
+            cb  = Gtk.CheckButton(); cb.set_active(wname == "clock")
+            row.pack_start(lbl, True,  True,  0)
+            row.pack_end(cb,    False, False, 10)
+            self._widget_cbs[wname] = cb
+            self._content.pack_start(row, False, False, 0)
+
+    def _collect_4(self):   # widgets page
+        enabled = [n for n, cb in self._widget_cbs.items() if cb.get_active()]
+        _save_config({"widgets": {"enabled": enabled}})
+
+    def _page_tools(self):
+        self._heading("Optional Tools",
+            "These tools unlock extra features. Install any that are missing.")
+        tools = [
+            ("swww / swaybg",  ["swww","swaybg"],  "Wallpaper daemon"),
+            ("playerctl",      ["playerctl"],       "Media controls in bar"),
+            ("wpctl",          ["wpctl"],           "Volume control"),
+            ("brightnessctl",  ["brightnessctl"],   "Brightness control"),
+            ("nmcli",          ["nmcli"],           "WiFi management"),
+            ("bluetoothctl",   ["bluetoothctl"],    "Bluetooth toggle"),
+            ("swaylock/hyprlock",["swaylock","hyprlock"],"Lock screen"),
+            ("makoctl/dunstctl",["makoctl","dunstctl"],"Notifications"),
+            ("fc-list",        ["fc-list"],         "Font picker"),
+        ]
+        grid = Gtk.Grid(); grid.set_row_spacing(8); grid.set_column_spacing(16)
+        for i, (label, cmds, desc) in enumerate(tools):
+            found = any(_has(c) for c in cmds)
+            icon  = Gtk.Label(label="✓" if found else "✗")
+            icon.set_markup(
+                f"<span foreground='{'#a6e3a1' if found else '#f38ba8'}' weight='bold'>"
+                f"{'✓' if found else '✗'}</span>")
+            name_lbl = Gtk.Label(label=label); name_lbl.set_halign(Gtk.Align.START)
+            desc_lbl = Gtk.Label(label=desc);  desc_lbl.set_name("wiz-sub")
+            desc_lbl.set_halign(Gtk.Align.START)
+            grid.attach(icon,     0, i, 1, 1)
+            grid.attach(name_lbl, 1, i, 1, 1)
+            grid.attach(desc_lbl, 2, i, 1, 1)
+        self._content.pack_start(grid, False, False, 0)
+
+    def _page_finish(self):
+        self._heading("All done! 🎉", "Essentials Shell is ready to go.")
+        lbl = Gtk.Label(label=(
+            "Your settings have been saved.\n\n"
+            f"  • Theme:     {self._selections.get('theme','catppuccin')}\n"
+            f"  • Bar style: {self._selections.get('bar_style','trilands')}\n"
+            f"  • Compositor: {WM.name}\n\n"
+            "Click Finish to start the bar, or close this window."
+        ))
+        lbl.set_halign(Gtk.Align.START); lbl.set_name("wiz-body")
+        self._content.pack_start(lbl, False, False, 0)
+        self._next_btn.connect("clicked", self._launch)
+
+    def _launch(self, _=None):
+        open(DONE_FLAG,"w").write("done")
+        # Write OSD keybinds into compositor config
+        self._write_osd_keybinds()
+        # Start widgets if any enabled
+        cfg = {}
+        try:
+            with open(CONFIG_PATH) as f: cfg = json.load(f)
+        except: pass
+        if cfg.get("widgets",{}).get("enabled"):
+            subprocess.Popen(["python3", f"{BIN}/essentials-widgets"])
+        subprocess.Popen(["python3", f"{BIN}/essentials-bars"])
+        Gtk.main_quit()
+
+    def _write_osd_keybinds(self):
+        """Inject OSD media key binds into the compositor config."""
+        conf = WM.get_config_path()
+        if not conf or not os.path.exists(conf): return
+        osd = f"{BIN}/essentials-osd"
+        if WM.name == "hyprland":
+            binds = [
+                f"bind = , XF86AudioRaiseVolume,  exec, python3 {osd} volume up",
+                f"bind = , XF86AudioLowerVolume,  exec, python3 {osd} volume down",
+                f"bind = , XF86AudioMute,         exec, python3 {osd} volume mute",
+                f"bind = , XF86MonBrightnessUp,   exec, python3 {osd} bright up",
+                f"bind = , XF86MonBrightnessDown, exec, python3 {osd} bright down",
+                f"bind = , XF86AudioPlay,         exec, playerctl play-pause",
+                f"bind = , XF86AudioNext,         exec, playerctl next",
+                f"bind = , XF86AudioPrev,         exec, playerctl previous",
+            ]
+        elif WM.name == "sway":
+            binds = [
+                f"bindsym XF86AudioRaiseVolume  exec python3 {osd} volume up",
+                f"bindsym XF86AudioLowerVolume  exec python3 {osd} volume down",
+                f"bindsym XF86AudioMute         exec python3 {osd} volume mute",
+                f"bindsym XF86MonBrightnessUp   exec python3 {osd} bright up",
+                f"bindsym XF86MonBrightnessDown exec python3 {osd} bright down",
+                f"bindsym XF86AudioPlay  exec playerctl play-pause",
+                f"bindsym XF86AudioNext  exec playerctl next",
+                f"bindsym XF86AudioPrev  exec playerctl previous",
+            ]
+        else:
+            return  # river/labwc/mangowc — user adds manually
+        try:
+            with open(conf) as f: existing = f.read()
+            new_binds = [b for b in binds if b.split("exec")[0].strip() not in existing]
+            if new_binds:
+                with open(conf,"a") as f:
+                    f.write("\n# Essentials OSD keybinds (added by wizard)\n")
+                    f.writelines(b+"\n" for b in new_binds)
+        except Exception as e:
+            print(f"[wizard] keybind write failed: {e}")
+
+    # ── Style ─────────────────────────────────────────────────────────────────
+    def _apply_style(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            #wiz-root    { background-color: #11111b; }
+            #wiz-content { background-color: #11111b; }
+            #wiz-progress { min-height: 4px; }
+            #wiz-progress trough  { background-color: #1e1e2e; border-radius: 0; min-height: 4px; }
+            #wiz-progress progress{ background-color: #cba6f7; border-radius: 0; }
+            #wiz-sub  { font-size: 12px; color: #7f849c; }
+            #wiz-body { font-size: 14px; color: #cdd6f4; }
+            .theme-btn, #theme-btn {
+                background-color: #1e1e2e; color: #a6adc8;
+                border: 1px solid #313244; border-radius: 10px;
+                padding: 12px 16px; font-size: 13px; font-weight: bold;
+                min-width: 160px;
+            }
+            .theme-btn:hover, #theme-btn:hover {
+                background-color: rgba(203,166,247,0.12);
+                border-color: #cba6f7; color: #cba6f7;
+            }
+            #theme-btn-active {
+                background-color: rgba(203,166,247,0.18);
+                border: 2px solid #cba6f7; border-radius: 10px;
+                padding: 12px 16px; font-size: 13px; font-weight: bold;
+                color: #cba6f7; min-width: 160px;
+            }
+            #nav-btn {
+                background-color: #1e1e2e; color: #a6adc8;
+                border: 1px solid #313244; border-radius: 9px;
+                padding: 10px 20px; font-size: 13px; font-weight: bold;
+            }
+            #nav-btn-primary {
+                background-color: rgba(203,166,247,0.18);
+                border: 2px solid #cba6f7; color: #cba6f7;
+                border-radius: 9px; padding: 10px 24px;
+                font-size: 13px; font-weight: bold;
+            }
+            #nav-btn-primary:hover { background-color: #cba6f7; color: #11111b; }
+            separator { background-color: #1e1e2e; min-height: 1px; }
+            * { font-family: 'JetBrainsMono Nerd Font', monospace; color: #cdd6f4; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+if __name__ == "__main__":
+    import sys
+    force = "--force" in sys.argv
+    if not force and os.path.exists(DONE_FLAG):
+        print("Wizard already completed. Use --force to re-run.")
+        sys.exit(0)
+    Wizard(); Gtk.main()
