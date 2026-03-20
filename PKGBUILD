@@ -1,10 +1,10 @@
-# Maintainer: Your Name <your@email.com>
+
 pkgname=essentials-shell
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="Lightweight compositor-agnostic Wayland desktop shell"
 arch=('any')
-url="https://github.com/yourname/essentials-shell"
+url="https://github.com/franiekidos/essentials-shell"
 license=('MIT')
 depends=(
     'python>=3.10'
@@ -31,11 +31,11 @@ optdepends=(
     'wlr-randr: monitor control on River/Labwc/MangoWC'
     'hyprpm: Hyprland plugin manager'
 )
-source=("$pkgname-$pkgver.tar.gz")
+source=("git+https://github.com/franiekidos/essentials-shell")
 sha256sums=('SKIP')
 
 package() {
-    cd "$srcdir/$pkgname-$pkgver"
+    cd "$srcdir/"
 
     install -d "$pkgdir/usr/lib/essentials"
     install -d "$pkgdir/usr/share/essentials"
