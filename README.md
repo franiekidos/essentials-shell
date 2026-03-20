@@ -85,7 +85,7 @@
 ```bash
 git clone https://github.com/yourname/essentials-shell
 cd essentials-shell
-make install
+sh install.sh
 ```
 
 ### Arch Linux / AUR
