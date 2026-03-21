@@ -93,6 +93,13 @@ def set_brightness(action):
 class OSD(Gtk.Window):
     def __init__(self, kind, action):
         Gtk.Window.__init__(self)
+        self.set_name("osd-win")
+        self.set_app_paintable(True)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual() if screen else None
+        if visual:
+            self.set_visual(visual)
+        self.connect("draw", self._on_draw)
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
         GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
@@ -140,14 +147,27 @@ class OSD(Gtk.Window):
         self.show_all()
         GLib.timeout_add(OSD_DURATION_MS, Gtk.main_quit)
 
+    def _on_draw(self, _, cr):
+        # Keep the window fully transparent outside the rounded OSD box.
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.set_operator(1)  # CLEAR
+        cr.paint()
+        cr.set_operator(2)  # OVER
+        return False
+
     def _apply_style(self):
         css = Gtk.CssProvider()
         css.load_from_data(f"""
+            #osd-win, window, .background {{
+                background-color: transparent;
+                box-shadow: none;
+            }}
             #osd-box {{
                 background-color: {T.get('bg','rgba(17,17,27,0.95)')};
-                border:           1px solid rgba(255,255,255,0.10);
+                border:           1px solid rgba(255,255,255,0.14);
                 border-radius:    16px;
                 min-width:        280px;
+                box-shadow:       0 8px 28px rgba(0,0,0,0.35);
             }}
             #osd-icon  {{ font-size: 22px; color: {T.get('accent','#cba6f7')}; }}
             #osd-label {{ font-size: 14px; font-weight: bold;

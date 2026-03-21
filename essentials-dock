@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+essentials-dock — OSD-style compact dock bar (HARDCODED)
+
+Floating island-style dock that appears on demand.
+All settings are hardcoded - no config file needed.
+
+FIX: Keep window visible but transparent when hidden so hover events still work.
+"""
+import gi, os, sys, subprocess
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk, Gio
+
+# ── HARDCODED SETTINGS ────────────────────────────────────────────────────────
+POS         = "bottom"          # bottom | top | left | right
+ISIZE       = 32                # Icon size in pixels
+TRANSPARENCY = 0.70             # 0.0 (invisible) to 1.0 (opaque)
+TRANSPARENCY_HIDDEN = 0.15      # Transparency when hidden (still receives events)
+HIDE        = True              # Auto-hide enabled
+HIDE_DELAY  = 1000              # Milliseconds before hiding
+SHOW_DELAY  = 2000              # Milliseconds before initial hide
+MAX_RUNNING = 12                # Max running apps to show
+MARGIN      = 10                # Margin from screen edge (floating effect)
+
+# ── PINNED APPS ───────────────────────────────────────────────────────────────
+PINNED = [
+    {"name": "Terminal", "exec": "kitty",           "icon": "utilities-terminal"},
+    {"name": "Browser",  "exec": "firefox",         "icon": "firefox"},
+    {"name": "Files",    "exec": "nautilus",        "icon": "system-file-manager"},
+    {"name": "Editor",   "exec": "code",            "icon": "visual-studio-code"},
+    {"name": "Settings", "exec": "gnome-control-center", "icon": "preferences-system"},
+]
+
+VERTICAL = POS in ("left", "right")
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+def _build_css(alpha):
+    # Hardcoded colors (Catppuccin Mocha inspired)
+    bg_r, bg_g, bg_b = 30, 30, 46
+    accent      = "#cba6f7"
+    text        = "#cdd6f4"
+    sep_col     = "rgba(255,255,255,0.15)"
+    
+    # FIX: Proper RGBA format with dynamic alpha
+    surface = f"rgba({bg_r},{bg_g},{bg_b},{alpha})"
+    surface_hover = f"rgba(40,40,55,{min(1.0, alpha + 0.20)})"
+
+    # Border radius based on position
+    radius = "16px"
+    if POS == 'top':
+        border_radius = f"0 0 {radius} {radius}"
+    elif POS == 'bottom':
+        border_radius = f"{radius} {radius} 0 0"
+    elif POS == 'left':
+        border_radius = f"0 {radius} {radius} 0"
+    else:  # right
+        border_radius = f"{radius} 0 0 {radius}"
+
+    # Padding based on orientation
+    if VERTICAL:
+        padding = "10px 6px"
+        sep_style = "min-width: 1px; margin: 6px 0;"
+    else:
+        padding = "6px 10px"
+        sep_style = "min-height: 1px; margin: 0 6px;"
+
+    return f"""
+        #dock-window, window, .background {{
+            background-color: transparent;
+            box-shadow: none;
+        }}
+        #dock-win {{
+            background-color: {surface};
+            border:           1px solid rgba(255,255,255,0.12);
+            border-radius:    {border_radius};
+            box-shadow:       0 10px 30px rgba(0,0,0,0.36);
+            transition:       background-color 0.2s ease;
+        }}
+        #dock-inner {{
+            padding: {padding};
+            background: transparent;
+        }}
+        #dock-sep {{
+            background-color: {sep_col};
+            {sep_style}
+        }}
+        .dock-btn {{
+            background: transparent;
+            border:     none;
+            border-radius: 8px;
+            padding:    4px;
+            min-width:  0;
+            min-height: 0;
+        }}
+        .dock-btn:hover  {{ background-color: rgba(255,255,255,0.12); }}
+        .dock-btn:active {{ background-color: rgba(255,255,255,0.25); }}
+        .dock-win-btn {{
+            background: {surface_hover};
+            border:     none;
+            border-radius: 8px;
+            padding:    4px;
+            min-width:  0;
+            min-height: 0;
+        }}
+        .dock-win-btn:hover  {{
+            background-color: rgba(255,255,255,0.15);
+            border: none;
+        }}
+        .dock-win-btn:active {{ background-color: rgba(255,255,255,0.30); }}
+        .dock-dot {{
+            font-size: 5px;
+            color: {accent};
+            margin: 0;
+            padding: 0;
+            min-height: 0;
+        }}
+        * {{
+            font-family: 'JetBrainsMono Nerd Font', monospace;
+            color: {text};
+        }}
+    """
+
+
+# ── Icon lookup ───────────────────────────────────────────────────────────────
+def _icon(name, size):
+    img = Gtk.Image()
+    theme = Gtk.IconTheme.get_default()
+    
+    for cand in (name, name.lower(), name.replace("-","_"),
+                 name.replace("_","-"), name.split(".")[0]):
+        if theme.has_icon(cand):
+            img.set_from_icon_name(cand, Gtk.IconSize.INVALID)
+            img.set_pixel_size(size)
+            return img
+    
+    for app in Gio.AppInfo.get_all():
+        aname = (app.get_name() or "").lower()
+        if name.lower() in aname or aname in name.lower():
+            ico = app.get_icon()
+            if ico:
+                img.set_from_gicon(ico, Gtk.IconSize.INVALID)
+                img.set_pixel_size(size)
+                return img
+    
+    img.set_from_icon_name("application-x-executable", Gtk.IconSize.INVALID)
+    img.set_pixel_size(size)
+    return img
+
+
+# ── Running windows ───────────────────────────────────────────────────────────
+def _get_windows():
+    try:
+        import json
+        result = subprocess.run(["hyprctl", "-j", "clients"], 
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode == 0 and result.stdout:
+            raw = json.loads(result.stdout)
+            return [{"title": w.get("title","")[:20],
+                     "class": w.get("class",""),
+                     "pid":   w.get("pid",0)}
+                    for w in raw if w.get("title")]
+        
+        result = subprocess.run(["swaymsg", "-t", "get_tree"], 
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode == 0 and result.stdout:
+            raw = json.loads(result.stdout)
+            wins = []
+            def _walk(n):
+                if n.get("type") in ("con","floating_con") and n.get("name"):
+                    wins.append({"title": n["name"][:20],
+                                 "class": n.get("app_id",""), 
+                                 "pid": n.get("pid",0)})
+                for c in n.get("nodes",[]) + n.get("floating_nodes",[]): 
+                    _walk(c)
+            _walk(raw)
+            return wins
+    except Exception as e:
+        pass
+    return []
+
+
+# ── Dock window ───────────────────────────────────────────────────────────────
+class Dock(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        self.set_name("dock-window")
+        self.set_app_paintable(True)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual() if screen else None
+        if visual:
+            self.set_visual(visual)
+        self.connect("draw", self._on_draw)
+        self._hide_timer = None
+        self._hidden = False
+        self._css_provider = None
+        self._current_alpha = TRANSPARENCY
+
+        # ── Layer shell setup ─────────────────────────────────────────────────
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(self, 0)
+
+        # Anchor to edge
+        edge_map = {
+            "bottom": (GtkLayerShell.Edge.BOTTOM,
+                       GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT),
+            "top":    (GtkLayerShell.Edge.TOP,
+                       GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT),
+            "left":   (GtkLayerShell.Edge.LEFT,
+                       GtkLayerShell.Edge.TOP,  GtkLayerShell.Edge.BOTTOM),
+            "right":  (GtkLayerShell.Edge.RIGHT,
+                       GtkLayerShell.Edge.TOP,  GtkLayerShell.Edge.BOTTOM),
+        }
+        primary, span_a, span_b = edge_map.get(POS, edge_map["bottom"])
+        for edge in (primary, span_a, span_b):
+            GtkLayerShell.set_anchor(self, edge, True)
+        
+        # Float away from edges
+        GtkLayerShell.set_margin(self, primary, MARGIN)
+        GtkLayerShell.set_margin(self, span_a, MARGIN)
+        GtkLayerShell.set_margin(self, span_b, MARGIN)
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        orient = Gtk.Orientation.VERTICAL if VERTICAL else Gtk.Orientation.HORIZONTAL
+
+        outer = Gtk.Box(orientation=orient, spacing=0)
+        outer.set_name("dock-win")
+        self.add(outer)
+
+        self._inner = Gtk.Box(orientation=orient, spacing=4)
+        self._inner.set_name("dock-inner")
+        outer.pack_start(self._inner, False, False, 0)
+        
+        if not VERTICAL:
+            outer.set_halign(Gtk.Align.CENTER)
+        else:
+            outer.set_valign(Gtk.Align.CENTER)
+
+        # ── Pinned apps ───────────────────────────────────────────────────────
+        for item in PINNED:
+            self._inner.pack_start(self._pinned_btn(item), False, False, 0)
+
+        # ── Separator + running windows ───────────────────────────────────────
+        self._sep = Gtk.Separator(
+            orientation=Gtk.Orientation.HORIZONTAL if VERTICAL
+                        else Gtk.Orientation.VERTICAL)
+        self._sep.set_name("dock-sep")
+        self._run_box = Gtk.Box(orientation=orient, spacing=4)
+
+        # ── CSS ───────────────────────────────────────────────────────────────
+        self._css_provider = Gtk.CssProvider()
+        self._apply_css(TRANSPARENCY)
+
+        # ── Events ────────────────────────────────────────────────────────────
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK |
+                        Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("enter-notify-event", self._on_enter)
+        self.connect("leave-notify-event", self._on_leave)
+
+        # Show then hide after delay
+        self.show_all()
+        self._sep.hide()
+        
+        if HIDE:
+            GLib.timeout_add(SHOW_DELAY, self._do_hide)
+
+        # Running window refresh
+        GLib.idle_add(self._refresh_running)
+        GLib.timeout_add(2000, self._refresh_running)
+
+    def _apply_css(self, alpha):
+        """Re-apply CSS with new transparency value"""
+        self._css_provider.load_from_data(_build_css(alpha).encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), 
+            self._css_provider, 
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _on_draw(self, _, cr):
+        # Make areas outside rounded dock shape fully transparent.
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.set_operator(1)  # CLEAR
+        cr.paint()
+        cr.set_operator(2)  # OVER
+        return False
+
+    # ── Pinned button ─────────────────────────────────────────────────────────
+    def _pinned_btn(self, item):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("dock-btn")
+        btn.set_tooltip_text(item.get("name",""))
+        btn.add(_icon(item.get("icon","application-x-executable"), ISIZE))
+        btn.connect("clicked", lambda _, c=item.get("exec",""): self._launch_app(c))
+        btn.connect("button-press-event", lambda b,ev,i=item: self._pin_menu(b, ev, i))
+        return btn
+
+    def _launch_app(self, cmd):
+        try:
+            if cmd:
+                subprocess.Popen(cmd.split(), stderr=subprocess.DEVNULL)
+                if HIDE:
+                    GLib.timeout_add(500, self._do_hide)
+        except Exception as e:
+            print(f"[dock] launch error: {e}")
+
+    def _pin_menu(self, btn, event, item):
+        if event.button != 3: 
+            return False
+        menu = Gtk.Menu()
+        li = Gtk.MenuItem(label=f"Launch {item.get('name','')}")
+        li.connect("activate", lambda _: self._launch_app(item.get("exec","")))
+        menu.append(li)
+        menu.show_all()
+        menu.popup_at_widget(btn, Gdk.Gravity.NORTH, Gdk.Gravity.SOUTH, event)
+        return True
+
+    # ── Running windows ───────────────────────────────────────────────────────
+    def _refresh_running(self):
+        for c in self._run_box.get_children():
+            self._run_box.remove(c)
+
+        wins = _get_windows()
+
+        if wins:
+            if self._sep not in self._inner.get_children():
+                self._inner.pack_start(self._sep, False, False, 0)
+                self._inner.pack_start(self._run_box, False, False, 0)
+            self._sep.show()
+            for w in wins[:MAX_RUNNING]:
+                self._run_box.pack_start(self._win_btn(w), False, False, 0)
+            self._run_box.show_all()
+        else:
+            self._sep.hide()
+            self._run_box.hide()
+
+        return True
+
+    def _win_btn(self, win):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("dock-win-btn")
+        btn.set_tooltip_text(win["title"])
+
+        overlay = Gtk.Overlay()
+        overlay.add(_icon(win.get("class",""), ISIZE - 6))
+        dot = Gtk.Label(label="⬤")
+        dot.get_style_context().add_class("dock-dot")
+        dot.set_halign(Gtk.Align.CENTER)
+        dot.set_valign(Gtk.Align.END)
+        overlay.add_overlay(dot)
+        btn.add(overlay)
+
+        pid = win.get("pid", 0)
+
+        def _focus(_):
+            try:
+                if pid:
+                    subprocess.run(["hyprctl","dispatch","focuswindow",f"pid:{pid}"],
+                                   stderr=subprocess.DEVNULL, timeout=2)
+                if HIDE:
+                    GLib.timeout_add(500, self._do_hide)
+            except:
+                try:
+                    subprocess.run(["swaymsg",f'[title="{win["title"]}"] focus'],
+                                   stderr=subprocess.DEVNULL, timeout=2)
+                except:
+                    pass
+
+        btn.connect("clicked", _focus)
+        btn.connect("button-press-event",
+                    lambda b,ev,p=pid,t=win["title"]: self._close_win(ev,p,t))
+        return btn
+
+    def _close_win(self, event, pid, title):
+        if event.button != 2: 
+            return False
+        try:
+            if pid:
+                subprocess.run(["hyprctl","dispatch","closewindow",f"pid:{pid}"],
+                               stderr=subprocess.DEVNULL, timeout=2)
+            else:
+                subprocess.run(["swaymsg",f'[title="{title}"] kill'],
+                               stderr=subprocess.DEVNULL, timeout=2)
+        except:
+            pass
+        GLib.timeout_add(400, self._refresh_running)
+        return True
+
+    # ── Auto-hide ─────────────────────────────────────────────────────────────
+    def _do_hide(self):
+        """Make dock nearly transparent but still receive events"""
+        if not self._hidden:
+            self._hidden = True
+            self._current_alpha = TRANSPARENCY_HIDDEN
+            self._apply_css(self._current_alpha)
+        return False
+
+    def _do_show(self):
+        """Make dock fully visible"""
+        if self._hidden:
+            self._hidden = False
+            self._current_alpha = TRANSPARENCY
+            self._apply_css(self._current_alpha)
+
+    def _on_enter(self, *_):
+        """FIX: Cancel hide timer and show dock"""
+        if self._hide_timer:
+            GLib.source_remove(self._hide_timer)
+            self._hide_timer = None
+        self._do_show()
+
+    def _on_leave(self, *_):
+        """Start hide timer when cursor leaves"""
+        if HIDE:
+            self._hide_timer = GLib.timeout_add(HIDE_DELAY, self._do_hide)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    dock = Dock()
+    Gtk.main()
