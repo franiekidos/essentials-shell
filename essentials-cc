@@ -72,6 +72,8 @@ except Exception:
 class EssentialsCC(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self)
+        self._osd_vol_timer = None
+        self._osd_bri_timer = None
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
         GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
@@ -114,6 +116,31 @@ class EssentialsCC(Gtk.Window):
         self._update_media()
         GLib.timeout_add(2500, self._update_stats)
         GLib.timeout_add(2000, self._update_media)
+
+    def _spawn_osd(self, kind, value):
+        osd_path = os.path.expanduser("~/.local/bin/essentials-osd")
+        if not os.path.exists(osd_path):
+            return
+        # Ensure only one OSD instance is alive at a time.
+        subprocess.run(["pkill", "-f", "essentials-osd"], stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            ["python3", osd_path, kind, str(value)],
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _queue_osd(self, kind, value):
+        # Debounce slider updates to avoid spawning many OSD windows while dragging.
+        attr = "_osd_vol_timer" if kind == "volume" else "_osd_bri_timer"
+        timer_id = getattr(self, attr)
+        if timer_id:
+            GLib.source_remove(timer_id)
+
+        def _emit():
+            setattr(self, attr, None)
+            self._spawn_osd(kind, value)
+            return False
+
+        setattr(self, attr, GLib.timeout_add(100, _emit))
 
     # ── Separator ─────────────────────────────────────────────────────────────
     def _sep(self):
@@ -250,19 +277,13 @@ class EssentialsCC(Gtk.Window):
         v = int(w.get_value()); self.vol_pct.set_text(f"{v}%")
         subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v/100:.2f}"],
                        stderr=subprocess.DEVNULL)
-        _osd = os.path.expanduser("~/.local/bin/essentials-osd")
-        if os.path.exists(_osd):
-            subprocess.Popen(["python3", _osd, "volume", str(v)],
-                             stderr=subprocess.DEVNULL)
+        self._queue_osd("volume", v)
 
     def _on_bri(self, w):
         if not HAS["brightnessctl"]: return
         v = int(w.get_value()); self.bri_pct.set_text(f"{v}%")
         subprocess.run(["brightnessctl", "set", f"{v}%"], stderr=subprocess.DEVNULL)
-        _osd = os.path.expanduser("~/.local/bin/essentials-osd")
-        if os.path.exists(_osd):
-            subprocess.Popen(["python3", _osd, "bright", str(v)],
-                             stderr=subprocess.DEVNULL)
+        self._queue_osd("bright", v)
 
     # ── Toggles (WiFi + Bluetooth) ────────────────────────────────────────────
     def _unavailable(self, icon, msg):
