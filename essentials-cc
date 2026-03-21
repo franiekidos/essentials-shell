@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import gi, os, json, subprocess, psutil
+import gi, os, json, subprocess, psutil, time
 gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import Gtk, GtkLayerShell, Gdk, GLib
@@ -74,6 +74,8 @@ class EssentialsCC(Gtk.Window):
         Gtk.Window.__init__(self)
         self._osd_vol_timer = None
         self._osd_bri_timer = None
+        self._osd_last_emit = {"volume": 0.0, "bright": 0.0}
+        self._osd_pending = {"volume": None, "bright": None}
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
         GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
@@ -129,18 +131,39 @@ class EssentialsCC(Gtk.Window):
         )
 
     def _queue_osd(self, kind, value):
-        # Debounce slider updates to avoid spawning many OSD windows while dragging.
+        # Throttle updates so OSD responds immediately, without process spam.
         attr = "_osd_vol_timer" if kind == "volume" else "_osd_bri_timer"
         timer_id = getattr(self, attr)
+        now = time.monotonic()
+        min_gap = 0.15  # 150ms between OSD spawns
+        elapsed = now - self._osd_last_emit.get(kind, 0.0)
+
+        if elapsed >= min_gap:
+            if timer_id:
+                GLib.source_remove(timer_id)
+                setattr(self, attr, None)
+            self._osd_pending[kind] = None
+            self._osd_last_emit[kind] = now
+            self._spawn_osd(kind, value)
+            return
+
+        self._osd_pending[kind] = value
         if timer_id:
-            GLib.source_remove(timer_id)
+            return
+
+        wait_ms = max(1, int((min_gap - elapsed) * 1000))
 
         def _emit():
+            pending = self._osd_pending.get(kind)
             setattr(self, attr, None)
-            self._spawn_osd(kind, value)
+            if pending is None:
+                return False
+            self._osd_pending[kind] = None
+            self._osd_last_emit[kind] = time.monotonic()
+            self._spawn_osd(kind, pending)
             return False
 
-        setattr(self, attr, GLib.timeout_add(100, _emit))
+        setattr(self, attr, GLib.timeout_add(wait_ms, _emit))
 
     # ── Separator ─────────────────────────────────────────────────────────────
     def _sep(self):

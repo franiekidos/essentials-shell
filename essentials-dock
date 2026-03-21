@@ -5,7 +5,7 @@ essentials-dock — OSD-style compact dock bar (HARDCODED)
 Floating island-style dock that appears on demand.
 All settings are hardcoded - no config file needed.
 
-FIX: Keep window visible but transparent when hidden so hover events still work.
+FIX: Keep window visible but transparent when hidden 1so hover events still work.
 """
 import gi, os, sys, subprocess
 gi.require_version('Gtk', '3.0')
