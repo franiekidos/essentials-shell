@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+essentials-clipboard — Clipboard history viewer
+
+Requires cliphist + wl-copy for full functionality.
+Falls back gracefully if cliphist is not installed.
+"""
+import gi, os, sys, shutil, subprocess
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk
+
+sys.path.insert(0, os.path.expanduser("~/.local/bin"))
+from essentials_lib import load_theme, apply_css, _run, BIN
+
+T             = load_theme()
+HAS_CLIPHIST  = shutil.which("cliphist") is not None
+HAS_WLCOPY    = shutil.which("wl-copy")  is not None
+MAX_ITEMS     = 50
+MAX_PREVIEW   = 80
+
+
+def _css():
+    bg     = T.get("bg",     "rgba(17,17,27,0.92)")
+    accent = T.get("accent", T.get("accent","#cba6f7"))
+    text   = T.get("text",   T.get("text","#cdd6f4"))
+    radius = T.get("radius", "12px")
+    return f"""
+        #clip-root {{
+            background-color: #11111b;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: {radius};
+        }}
+        #clip-header {{ background-color: #0d0d17; border-bottom: 1px solid #1e1e2e; }}
+        #clip-search-box entry {{
+            background-color: #1e1e2e; color: {text};
+            border: 1px solid #313244; border-radius: 10px;
+            padding: 10px 14px; font-size: 14px;
+            font-family: 'JetBrainsMono Nerd Font';
+        }}
+        #clip-search-box entry:focus {{ border-color: {accent}; }}
+        #clip-list  {{ background-color: transparent; }}
+        #clip-row   {{ border-radius: 8px; margin: 2px 8px; }}
+        #clip-row:hover    {{ background-color: rgba(255,255,255,0.06); }}
+        #clip-row:selected {{ background-color: rgba(255,255,255,0.12); }}
+        #clip-row:selected #clip-lbl {{ color: {accent}; }}
+        #clip-lbl {{
+            font-family: 'JetBrainsMono Nerd Font', monospace;
+            font-size: 13px; color: {text};
+        }}
+        #clip-hint  {{ font-size: 11px; color: rgba(255,255,255,0.25);
+                       font-family: 'JetBrainsMono Nerd Font'; }}
+        #clip-close, #clip-clear {{
+            background-color: transparent;
+            border: 1px solid rgba(255,255,255,0.12); border-radius: 7px;
+            font-size: 12px; padding: 3px 8px;
+        }}
+        #clip-close:hover {{ background-color: rgba(243,139,168,0.8);
+                             color: #11111b; }}
+        #clip-clear:hover {{ background-color: rgba(243,139,168,0.8);
+                             color: #11111b; }}
+        * {{ font-family: 'JetBrainsMono Nerd Font', monospace; color: {text}; }}
+        scrollbar {{ background-color: transparent; min-width: 5px; }}
+        scrollbar slider {{ background-color: rgba(255,255,255,0.10);
+                            border-radius: 3px; min-height: 28px; }}
+    """
+
+
+def _get_history():
+    if not HAS_CLIPHIST: return []
+    raw = _run("cliphist", "list")
+    items = []
+    for line in raw.splitlines()[:MAX_ITEMS]:
+        parts = line.split("\t", 1)
+        cid, text = (parts[0], parts[1]) if len(parts) == 2 else ("", line)
+        preview   = text[:MAX_PREVIEW] + ("…" if len(text) > MAX_PREVIEW else "")
+        items.append((cid, preview, text))
+    return items
+
+
+def _paste(cid, raw_text):
+    if HAS_CLIPHIST and cid:
+        try:
+            proc = subprocess.Popen(
+                ["cliphist","decode"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+            decoded, _ = proc.communicate(
+                input=f"{cid}\t{raw_text}".encode())
+            if HAS_WLCOPY:
+                subprocess.run(["wl-copy"], input=decoded,
+                               stderr=subprocess.DEVNULL)
+                return True
+        except Exception as e:
+            print(f"[clipboard] paste failed: {e}")
+    if HAS_WLCOPY:
+        subprocess.run(["wl-copy"], input=raw_text.encode(),
+                       stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
+class ClipboardViewer(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+
+        self.connect("key-press-event", self._on_key)
+        apply_css(_css())
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_name("clip-root"); self.add(root)
+
+        # Header
+        hdr = Gtk.Box(spacing=10); hdr.set_name("clip-header")
+        hdr.set_margin_start(16); hdr.set_margin_end(16)
+        hdr.set_margin_top(14);   hdr.set_margin_bottom(10)
+        title = Gtk.Label()
+        notice = "" if HAS_CLIPHIST else \
+            "  <span size='small' foreground='#f9e2af'>cliphist not found</span>"
+        title.set_markup(f"<span size='large' weight='bold'>󰅍  Clipboard</span>{notice}")
+        close = Gtk.Button(label="✕"); close.set_name("clip-close")
+        close.connect("clicked", lambda _: Gtk.main_quit())
+        hdr.pack_start(title, False, False, 0)
+        hdr.pack_end(close,   False, False, 0)
+        if HAS_CLIPHIST:
+            clear = Gtk.Button(label="Clear All"); clear.set_name("clip-clear")
+            clear.connect("clicked", self._clear)
+            hdr.pack_end(clear, False, False, 4)
+        root.pack_start(hdr, False, False, 0)
+
+        # Search
+        sb = Gtk.Box(spacing=0); sb.set_name("clip-search-box")
+        sb.set_margin_start(14); sb.set_margin_end(14); sb.set_margin_bottom(10)
+        self._search = Gtk.SearchEntry()
+        self._search.set_placeholder_text("Search clipboard…")
+        self._search.set_hexpand(True)
+        self._search.connect("search-changed", lambda _: self._filter())
+        self._search.connect("activate",       lambda _: self._confirm())
+        sb.pack_start(self._search, True, True, 0)
+        root.pack_start(sb, False, False, 0)
+
+        # List
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(360)
+        scroll.set_min_content_width(520)
+        self._listbox = Gtk.ListBox(); self._listbox.set_name("clip-list")
+        self._listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._listbox.connect("row-activated", lambda _lb, row: self._paste_row(row))
+        scroll.add(self._listbox)
+        root.pack_start(scroll, True, True, 0)
+
+        # Hint
+        hint = Gtk.Label(label="Enter / click to copy  ·  Del to remove  ·  Esc to close")
+        hint.set_name("clip-hint")
+        hint.set_margin_top(8); hint.set_margin_bottom(10)
+        root.pack_start(hint, False, False, 0)
+
+        self._all  = _get_history()
+        self._show(self._all)
+        self.set_size_request(540, -1)
+        self.show_all()
+        GLib.idle_add(lambda: (self._search.grab_focus(), False)[1])
+
+    def _show(self, items):
+        for c in self._listbox.get_children():
+            self._listbox.remove(c)
+        for cid, preview, raw in items:
+            row = Gtk.ListBoxRow(); row.set_name("clip-row")
+            lbl = Gtk.Label(label=preview); lbl.set_name("clip-lbl")
+            lbl.set_halign(Gtk.Align.START); lbl.set_xalign(0)
+            lbl.set_ellipsize(3)
+            lbl.set_margin_start(14); lbl.set_margin_end(14)
+            lbl.set_margin_top(10);   lbl.set_margin_bottom(10)
+            row._cid  = cid
+            row._raw  = raw
+            row.add(lbl)
+            self._listbox.add(row)
+        self._listbox.show_all()
+
+    def _filter(self):
+        q = self._search.get_text().lower()
+        self._show([(c,p,r) for c,p,r in self._all if q in r.lower()])
+
+    def _confirm(self):
+        row = (self._listbox.get_selected_row()
+               or (self._listbox.get_children() or [None])[0])
+        if row: self._paste_row(row)
+
+    def _paste_row(self, row):
+        if _paste(row._cid, row._raw):
+            Gtk.main_quit()
+
+    def _clear(self, _=None):
+        if HAS_CLIPHIST:
+            subprocess.run(["cliphist","wipe"], stderr=subprocess.DEVNULL)
+        self._all = []
+        self._show([])
+
+    def _on_key(self, w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            Gtk.main_quit()
+        elif event.keyval == Gdk.KEY_Delete:
+            row = self._listbox.get_selected_row()
+            if row and HAS_CLIPHIST:
+                subprocess.run(["cliphist","delete"],
+                               input=f"{row._cid}\t{row._raw}".encode(),
+                               stderr=subprocess.DEVNULL)
+                self._all = _get_history()
+                self._filter()
+        elif event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._confirm()
+
+
+ClipboardViewer()
+Gtk.main()

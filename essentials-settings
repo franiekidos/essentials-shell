@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import gi, os, json, subprocess, shutil, importlib.util
+import gi, os, json, re, subprocess, shutil, importlib.util, importlib.machinery
 gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import Gtk, GtkLayerShell, Gdk, GLib, Pango
@@ -9,11 +9,11 @@ def _load_cw():
     path = os.path.expanduser("~/.local/bin/essentials-config-writer")
     if os.path.exists(path):
         try:
-            spec = importlib.util.spec_from_file_location("essentials_config_writer", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
+            loader = importlib.machinery.SourceFileLoader("essentials_config_writer", path)
+            spec   = importlib.util.spec_from_loader("essentials_config_writer", loader)
+            mod    = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
         except Exception as e:
             print(f"[settings] config-writer load failed: {e}")
     return None
@@ -28,11 +28,11 @@ def _load_wm():
     path = os.path.expanduser("~/.local/bin/essentials-detect")
     if os.path.exists(path):
         try:
-            spec = importlib.util.spec_from_file_location("essentials_detect", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod.detect()
+            loader = importlib.machinery.SourceFileLoader("essentials_detect", path)
+            spec   = importlib.util.spec_from_loader("essentials_detect", loader)
+            mod    = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod.detect()
         except Exception as e:
             import warnings; warnings.warn(f"essentials-detect failed: {e}")
     class _FB:
@@ -102,6 +102,9 @@ class EssentialsSettings(Gtk.Window):
         self._build_layout_tab()
         self._build_wallpaper_tab()
         self._build_widgets_tab()
+        self._build_dock_tab()
+        self._build_idle_tab()
+        self._build_weather_tab()
 
         self.apply_style()
         self.set_size_request(1200, 740)
@@ -531,7 +534,13 @@ class EssentialsSettings(Gtk.Window):
         self._speed_lbl.set_halign(Gtk.Align.START)
         self._speed_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1.0, 1.0, 0.05)
         self._speed_scale.set_draw_value(False)
-        init_speed = current.get("sensitivity", current.get("accel_speed", 0.0))
+        def _safe_float(v, default=0.0):
+            try:
+                # Strip inline comments and whitespace before parsing
+                return float(str(v).split('#')[0].strip())
+            except (ValueError, TypeError):
+                return default
+        init_speed = _safe_float(current.get("sensitivity", current.get("accel_speed", 0.0)))
         self._speed_scale.set_value(float(init_speed))
         self._speed_lbl.set_text(f"Pointer Speed: {float(init_speed):.2f}")
         self._speed_scale.connect("value-changed", lambda w: self._speed_lbl.set_text(
@@ -576,7 +585,7 @@ class EssentialsSettings(Gtk.Window):
         self._scroll_lbl = Gtk.Label(); self._scroll_lbl.set_halign(Gtk.Align.START)
         self._scroll_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 5.0, 0.1)
         self._scroll_scale.set_draw_value(False)
-        init_scroll = float(current.get("scroll_factor", current.get("scroll_speed", 1.0)))
+        init_scroll = _safe_float(current.get("scroll_factor", current.get("scroll_speed", 1.0)), 1.0)
         self._scroll_scale.set_value(init_scroll)
         self._scroll_lbl.set_text(f"Scroll Speed: {init_scroll:.1f}x")
         self._scroll_scale.connect("value-changed", lambda w: self._scroll_lbl.set_text(
@@ -1224,6 +1233,19 @@ class EssentialsSettings(Gtk.Window):
         desc.set_line_wrap(True)
         page.pack_start(desc, False, False, 0)
 
+        # Auto-hide toggle
+        try:
+            with open(CONFIG_PATH) as f: _ah_cfg = json.load(f)
+        except: _ah_cfg = {}
+        ah_row = Gtk.Box(spacing=12); ah_row.set_name("theme-row")
+        ah_lbl = Gtk.Label(label="󰨱  Auto-hide bar"); ah_lbl.set_name("theme-text")
+        self._autohide_sw = Gtk.Switch()
+        self._autohide_sw.set_active(_ah_cfg.get("bar_autohide", False))
+        self._autohide_sw.connect("notify::active", self._on_autohide_toggle)
+        ah_row.pack_start(ah_lbl, True, True, 0)
+        ah_row.pack_end(self._autohide_sw, False, False, 10)
+        page.pack_start(ah_row, False, False, 0)
+
         # Load current layout
         if CW:
             self._bar_layout = CW.load_bar_layout()
@@ -1235,12 +1257,28 @@ class EssentialsSettings(Gtk.Window):
             }
 
         ALL_WIDGETS = {
-            "launcher":"󰣇  Launcher","wm-badge":"󰖲  WM Badge",
-            "workspaces":"󰮯  Workspaces","clock":"󰥔  Clock",
-            "media":"󰝚  Media","cpu":"󰍛  CPU","ram":"󰘚  RAM",
-            "network":"󰖩  Network","temp":"󰔏  Temp","disk":"󰋊  Disk",
-            "battery":"󰁹  Battery","updates":"󰚰  Updates",
-            "cc-button":"󰒓  CC Button","power-button":"󰐥  Power",
+            "launcher":"󰣇  Launcher",
+            "wm-badge":"󰖲  WM Badge",
+            "workspaces":"󰮯  Workspaces",
+            "clock":"󰥔  Clock",
+            "date":"󰃭  Date",
+            "media":"󰝚  Media",
+            "cpu":"󰍛  CPU %",
+            "ram":"󰘚  RAM %",
+            "temp":"󰔏  Temp",
+            "disk":"󰋊  Disk %",
+            "battery":"󰁹  Battery",
+            "network":"󰖩  Network",
+            "volume":"󰕾  Volume",
+            "updates":"󰚰  Updates",
+            "weather":"󰖙  Weather",
+            "percore":"󰍛  Per-core CPU",
+            "clipboard":"󰅍  Clipboard",
+            "cc-button":"󰒓  CC Button",
+            "power-button":"󰐥  Power",
+            "lock":"󰌾  Lock",
+            "dock":"󰣉  Dock",
+            "wallpaper":"󰋩  Wallpaper",
             "separator":"│  Separator",
         }
 
@@ -1331,6 +1369,13 @@ class EssentialsSettings(Gtk.Window):
         data["bar_style"] = style_id
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w") as f: json.dump(data, f, indent=4)
+
+    def _on_autohide_toggle(self, sw, _p):
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        data["bar_autohide"] = sw.get_active()
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
 
     def _add_widget_dialog(self, section, store, all_widgets):
         dlg = Gtk.Dialog(title="Add Widget", parent=self, flags=Gtk.DialogFlags.MODAL)
@@ -1444,10 +1489,12 @@ class EssentialsSettings(Gtk.Window):
         subprocess.Popen(
             ["python3", "-c",
              "import importlib.util, os; "
-             "spec=importlib.util.spec_from_file_location('w',"
+             "import importlib.machinery; "
+             "loader=importlib.machinery.SourceFileLoader('w',"
              "os.path.expanduser('~/.local/bin/essentials-wallpaper')); "
+             "spec=importlib.util.spec_from_loader('w',loader); "
              "mod=importlib.util.module_from_spec(spec); "
-             "spec.loader.exec_module(mod); "
+             "loader.exec_module(mod); "
              "mod.restore_wallpaper()"],
             stderr=subprocess.DEVNULL)
 
@@ -1536,6 +1583,309 @@ class EssentialsSettings(Gtk.Window):
         ]
         with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
         self._msg("Widget config saved. Restart widgets to apply.")
+
+    # ── Dock tab ───────────────────────────────────────────────────────────────
+    def _build_dock_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.pack_start(self._section("Dock"), False, False, 0)
+
+        try:
+            with open(CONFIG_PATH) as f: cfg = json.load(f)
+        except: cfg = {}
+        dcfg = cfg.get("dock", {})
+
+        # Enable toggle
+        en_row = Gtk.Box(spacing=12); en_row.set_name("theme-row")
+        en_lbl = Gtk.Label(label="Enable dock"); en_lbl.set_name("theme-text")
+        self._dock_enabled = Gtk.Switch()
+        self._dock_enabled.set_active(dcfg.get("enabled", False))
+        en_row.pack_start(en_lbl, True, True, 0)
+        en_row.pack_end(self._dock_enabled, False, False, 10)
+        page.pack_start(en_row, False, False, 0)
+
+        # Position
+        pos_row = Gtk.Box(spacing=12)
+        pos_lbl = Gtk.Label(label="Position"); pos_lbl.set_halign(Gtk.Align.START)
+        pos_lbl.set_name("theme-text"); pos_lbl.set_hexpand(True)
+        self._dock_pos = Gtk.ComboBoxText()
+        positions = ["bottom","top","left","right"]
+        for p in positions:
+            self._dock_pos.append_text(p)
+        cur_pos = dcfg.get("position","bottom")
+        self._dock_pos.set_active(positions.index(cur_pos) if cur_pos in positions else 0)
+        pos_row.pack_start(pos_lbl,        True,  True,  0)
+        pos_row.pack_start(self._dock_pos, False, False, 0)
+        page.pack_start(pos_row, False, False, 0)
+
+        # Icon size
+        sz_row = Gtk.Box(spacing=12)
+        sz_lbl = Gtk.Label(label="Icon size"); sz_lbl.set_halign(Gtk.Align.START)
+        sz_lbl.set_name("theme-text"); sz_lbl.set_hexpand(True)
+        self._dock_size = Gtk.SpinButton.new_with_range(16, 64, 2)
+        self._dock_size.set_value(dcfg.get("icon_size", 28))
+        sz_row.pack_start(sz_lbl,         True,  True,  0)
+        sz_row.pack_start(self._dock_size, False, False, 0)
+        page.pack_start(sz_row, False, False, 0)
+
+        # Auto-hide
+        ah_row = Gtk.Box(spacing=12); ah_row.set_name("theme-row")
+        ah_lbl = Gtk.Label(label="Auto-hide"); ah_lbl.set_name("theme-text")
+        self._dock_autohide = Gtk.Switch()
+        self._dock_autohide.set_active(dcfg.get("autohide", False))
+        ah_row.pack_start(ah_lbl,            True,  True,  0)
+        ah_row.pack_end(self._dock_autohide, False, False, 10)
+        page.pack_start(ah_row, False, False, 0)
+
+        # Pinned apps editor
+        page.pack_start(self._section("Pinned Apps"), False, False, 0)
+        self._pin_store = Gtk.ListStore(str, str, str)  # name, exec, icon
+        for pin in dcfg.get("pinned", []):
+            self._pin_store.append([
+                pin.get("name",""), pin.get("exec",""), pin.get("icon","")])
+
+        self._pin_view = Gtk.TreeView(model=self._pin_store)
+        self._pin_view.set_name("kb-tree")
+        for col_i, col_title in enumerate(["Name","Command","Icon"]):
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("editable", True)
+            renderer.connect("edited", self._on_pin_edited, col_i)
+            self._pin_view.append_column(
+                Gtk.TreeViewColumn(col_title, renderer, text=col_i))
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(160); scroll.add(self._pin_view)
+        page.pack_start(scroll, True, True, 0)
+
+        pin_btns = Gtk.Box(spacing=10)
+        add_p = Gtk.Button(label="+ Add"); add_p.set_name("small-btn")
+        add_p.connect("clicked", lambda _:
+            self._pin_store.append(["App","","application-x-executable"]))
+        rem_p = Gtk.Button(label="Remove"); rem_p.set_name("btn-red")
+        rem_p.connect("clicked", self._on_pin_remove)
+        up_p  = Gtk.Button(label="↑"); up_p.set_name("small-btn")
+        up_p.connect("clicked",  lambda _: self._pin_move(-1))
+        dn_p  = Gtk.Button(label="↓"); dn_p.set_name("small-btn")
+        dn_p.connect("clicked",  lambda _: self._pin_move(1))
+        for b in (add_p, rem_p, up_p, dn_p):
+            pin_btns.pack_start(b, False, False, 0)
+        page.pack_start(pin_btns, False, False, 0)
+
+        btns = Gtk.Box(spacing=10)
+        save_btn = Gtk.Button(label="󰆓 Save"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", self._save_dock_config)
+        restart_btn = Gtk.Button(label="󰑓 Restart Dock")
+        restart_btn.connect("clicked", self._restart_dock)
+        btns.pack_start(save_btn,    False, False, 0)
+        btns.pack_start(restart_btn, False, False, 0)
+        page.pack_start(btns, False, False, 0)
+        self._tab(page, "󰣉 Dock")
+
+    def _on_pin_edited(self, renderer, path, text, col):
+        it = self._pin_store.get_iter(path)
+        if it:
+            self._pin_store.set_value(it, col, text)
+
+    def _on_pin_remove(self, _):
+        model, it = self._pin_view.get_selection().get_selected()
+        if it:
+            model.remove(it)
+
+    def _pin_move(self, direction):
+        model, it = self._pin_view.get_selection().get_selected()
+        if not it: return
+        path = model.get_path(it)
+        idx  = path.get_indices()[0]
+        swap = idx + direction
+        if 0 <= swap < len(model):
+            model.swap(model.get_iter(Gtk.TreePath(idx)),
+                       model.get_iter(Gtk.TreePath(swap)))
+
+    def _restart_dock(self, _=None):
+        subprocess.run(["pkill","-f","essentials-dock"], stderr=subprocess.DEVNULL)
+        import time; time.sleep(0.3)
+        subprocess.Popen(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-dock")],
+            stderr=subprocess.DEVNULL)
+
+    def _save_dock_config(self, _):
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        positions = ["bottom","top","left","right"]
+        idx = self._dock_pos.get_active()
+        data["dock"] = {
+            "enabled":  self._dock_enabled.get_active(),
+            "position": positions[idx] if 0 <= idx < len(positions) else "bottom",
+            "icon_size": int(self._dock_size.get_value()),
+            "autohide":  self._dock_autohide.get_active(),
+            "pinned":    [{"name":r[0],"exec":r[1],"icon":r[2]}
+                          for r in self._pin_store],
+        }
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+        self._msg("Dock config saved.")
+
+    # ── Idle tab ───────────────────────────────────────────────────────────────
+    def _build_idle_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.pack_start(self._section("Screen Lock & Idle"), False, False, 0)
+
+        try:
+            with open(CONFIG_PATH) as f: cfg = json.load(f)
+        except: cfg = {}
+        icfg = cfg.get("idle", {})
+
+        import shutil as _sh
+        note_text = "Using: "
+        for t in ("hypridle","swayidle"):
+            if _sh.which(t): note_text += t; break
+        else: note_text += "Python fallback (install swayidle or hypridle)"
+        note = Gtk.Label(label=note_text); note.set_name("mono-lbl")
+        note.set_halign(Gtk.Align.START); page.pack_start(note, False, False, 0)
+
+        def _slider_row(box, label, key, default, max_val):
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            lbl_row = Gtk.Box(spacing=10)
+            lbl = Gtk.Label(label=label); lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
+            val_lbl = Gtk.Label()
+            val_lbl.set_name("slider-pct")
+            cur = icfg.get(key, default)
+            val_lbl.set_text(f"{cur}s" if cur > 0 else "Disabled")
+            lbl_row.pack_start(lbl, True, True, 0); lbl_row.pack_end(val_lbl, False, False, 0)
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, max_val, 30)
+            scale.set_value(cur); scale.set_draw_value(False)
+            scale.connect("value-changed", lambda w: val_lbl.set_text(
+                f"{int(w.get_value())}s" if w.get_value() > 0 else "Disabled"))
+            vbox.pack_start(lbl_row, False, False, 0)
+            vbox.pack_start(scale,   False, False, 0)
+            box.pack_start(vbox, False, False, 0)
+            return scale
+
+        self._idle_lock   = _slider_row(page, "Lock screen after",    "lock_after",    300, 3600)
+        self._idle_screen = _slider_row(page, "Screen off after",     "screen_off",    600, 3600)
+        self._idle_suspend= _slider_row(page, "Suspend after (0=off)","suspend_after", 0,   7200)
+
+        btns = Gtk.Box(spacing=10)
+        save_btn  = Gtk.Button(label="󰆓 Save"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", self._save_idle_config)
+        start_btn = Gtk.Button(label="▶ Start Idle Daemon")
+        start_btn.connect("clicked", lambda _: subprocess.Popen(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-idle"), "start"]))
+        stop_btn  = Gtk.Button(label="■ Stop"); stop_btn.set_name("btn-red")
+        stop_btn.connect("clicked", lambda _: subprocess.Popen(
+            ["python3", os.path.expanduser("~/.local/bin/essentials-idle"), "stop"]))
+        btns.pack_start(save_btn,  False, False, 0)
+        btns.pack_start(start_btn, False, False, 0)
+        btns.pack_start(stop_btn,  False, False, 0)
+        page.pack_start(btns, False, False, 0)
+        self._tab(page, "󰌾 Idle")
+
+    def _save_idle_config(self, _):
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        data["idle"] = {
+            "lock_after":    int(self._idle_lock.get_value()),
+            "screen_off":    int(self._idle_screen.get_value()),
+            "suspend_after": int(self._idle_suspend.get_value()),
+        }
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+        self._msg("Idle config saved. Restart the idle daemon to apply.")
+
+    # ── Weather tab ────────────────────────────────────────────────────────────
+    def _build_weather_tab(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.pack_start(self._section("Weather"), False, False, 0)
+
+        try:
+            with open(CONFIG_PATH) as f: cfg = json.load(f)
+        except: cfg = {}
+        wcfg = cfg.get("weather", {})
+
+        # Location
+        self._wx_loc = self._entry_row(page, "Location (city or lat,lon):",
+                                       wcfg.get("location","Warsaw"))
+
+        # Units
+        units_row = Gtk.Box(spacing=12)
+        units_lbl = Gtk.Label(label="Units"); units_lbl.set_name("theme-text")
+        units_lbl.set_halign(Gtk.Align.START); units_lbl.set_hexpand(True)
+        self._wx_units = Gtk.ComboBoxText()
+        self._wx_units.append_text("celsius"); self._wx_units.append_text("fahrenheit")
+        self._wx_units.set_active(0 if wcfg.get("units","celsius")=="celsius" else 1)
+        units_row.pack_start(units_lbl,     True,  True,  0)
+        units_row.pack_start(self._wx_units, False, False, 0)
+        page.pack_start(units_row, False, False, 0)
+
+        # Provider
+        prov_row = Gtk.Box(spacing=12)
+        prov_lbl = Gtk.Label(label="Provider"); prov_lbl.set_name("theme-text")
+        prov_lbl.set_halign(Gtk.Align.START); prov_lbl.set_hexpand(True)
+        self._wx_prov = Gtk.ComboBoxText()
+        self._wx_prov.append_text("open-meteo (no key)")
+        self._wx_prov.append_text("wttr.in (no key)")
+        self._wx_prov.set_active(0 if wcfg.get("provider","open-meteo")=="open-meteo" else 1)
+        prov_row.pack_start(prov_lbl,     True,  True,  0)
+        prov_row.pack_start(self._wx_prov, False, False, 0)
+        page.pack_start(prov_row, False, False, 0)
+
+        # Show in bar toggle
+        bar_row = Gtk.Box(spacing=12); bar_row.set_name("theme-row")
+        bar_lbl = Gtk.Label(label="Show in bar"); bar_lbl.set_name("theme-text")
+        self._wx_bar = Gtk.Switch()
+        self._wx_bar.set_active(wcfg.get("show_in_bar", False))
+        bar_row.pack_start(bar_lbl,    True,  True,  0)
+        bar_row.pack_end(self._wx_bar, False, False, 10)
+        page.pack_start(bar_row, False, False, 0)
+
+        # Preview
+        self._wx_preview = Gtk.Label(label="")
+        self._wx_preview.set_name("mono-lbl"); self._wx_preview.set_halign(Gtk.Align.START)
+        page.pack_start(self._wx_preview, False, False, 0)
+
+        btns = Gtk.Box(spacing=10)
+        save_btn = Gtk.Button(label="󰆓 Save"); save_btn.set_name("btn-blue")
+        save_btn.connect("clicked", self._save_weather_config)
+        test_btn = Gtk.Button(label="󰑓 Test Fetch")
+        test_btn.connect("clicked", self._test_weather)
+        btns.pack_start(save_btn, False, False, 0)
+        btns.pack_start(test_btn, False, False, 0)
+        page.pack_start(btns, False, False, 0)
+        self._tab(page, "󰖙 Weather")
+
+    def _save_weather_config(self, _):
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        data["weather"] = {
+            "location":    self._wx_loc.get_text().strip(),
+            "units":       ["celsius","fahrenheit"][self._wx_units.get_active()],
+            "provider":    ["open-meteo","wttr"][self._wx_prov.get_active()],
+            "show_in_bar": self._wx_bar.get_active(),
+        }
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+        self._msg("Weather config saved. Restart bar to show in bar.")
+
+    def _test_weather(self, _):
+        self._wx_preview.set_text("Fetching…")
+        import threading, importlib.util, importlib.machinery, os as _os
+        def _do():
+            path = _os.path.expanduser("~/.local/bin/essentials-weather")
+            try:
+                loader = importlib.machinery.SourceFileLoader("ew", path)
+                spec   = importlib.util.spec_from_loader("ew", loader)
+                mod    = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                d    = mod.fetch_weather(self._wx_loc.get_text().strip() or None)
+                sym  = d.get("unit_symbol","°C")
+                text = (f"{d['icon']} {d['temp']}{sym}  {d['description']}  "
+                        f"Feels {d['feels_like']}{sym}  Wind {d['wind_kmh']}km/h  "
+                        f"Rain {d['precip_chance']}%  @ {d['location_name']}")
+            except Exception as e:
+                text = f"Error: {e}"
+            from gi.repository import GLib
+            GLib.idle_add(lambda: (self._wx_preview.set_text(text), False)[1])
+        threading.Thread(target=_do, daemon=True).start()
 
     def on_key_press(self, w, e):
         if e.keyval == Gdk.KEY_Escape: Gtk.main_quit()

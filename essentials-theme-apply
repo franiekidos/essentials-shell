@@ -37,6 +37,18 @@ def restart_bars():
         subprocess.Popen(["python3", WIDGET_BIN],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    DOCK_BIN = os.path.expanduser("~/.local/bin/essentials-dock")
+    try:
+        subprocess.check_output(["pgrep","-f","essentials-dock"], stderr=subprocess.DEVNULL)
+        dock_was_running = True
+    except subprocess.CalledProcessError:
+        dock_was_running = False
+    if dock_was_running and os.path.exists(DOCK_BIN):
+        _kill("essentials-dock")
+        time.sleep(0.2)
+        subprocess.Popen(["python3", DOCK_BIN],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def apply_theme_to_wm():
     """Load active theme and apply WM borders via config-writer."""
     import importlib.util, json

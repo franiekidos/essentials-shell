@@ -25,11 +25,11 @@ def _detect_wm():
     path = os.path.expanduser("~/.local/bin/essentials-detect")
     if os.path.exists(path):
         try:
-            spec = importlib.util.spec_from_file_location("essentials_detect", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod.detect().name
+            loader = importlib.machinery.SourceFileLoader("essentials_detect", path)
+            spec   = importlib.util.spec_from_loader("essentials_detect", loader)
+            mod    = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod.detect().name
         except Exception:
             pass
     return "generic"

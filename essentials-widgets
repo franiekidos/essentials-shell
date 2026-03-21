@@ -188,37 +188,51 @@ class MediaWidget(BaseWidget):
 
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
+_w_accent  = T.get("accent","#cba6f7")
+_w_text    = T.get("text","#cdd6f4")
+_w_subtext = T.get("subtext", T.get("text","#a6adc8"))
+
+_c_accent  = T.get("accent","#cba6f7")
+_c_text    = T.get("text","#cdd6f4")
+_c_subtext = T.get("subtext", T.get("text","#a6adc8"))
+
 css = Gtk.CssProvider()
-css.load_from_data(f"""
-    * {{ font-family: 'JetBrainsMono Nerd Font', monospace; }}
-    #widget-box {{ }}
-    .clock-time, #clock-time {{
-        font-size:   72px;
-        font-weight: bold;
-        color:       {T.get('text','#cdd6f4')};
-        text-shadow: 0 2px 8px rgba(0,0,0,0.8);
-    }}
-    #clock-date {{
-        font-size:  18px;
-        color:      {T.get('subtext', T.get('text','#a6adc8'))};
-        text-shadow: 0 1px 4px rgba(0,0,0,0.8);
-    }}
-    #sysinfo-icon {{ font-size: 13px; color: {T.get('accent','#cba6f7')};
-                     min-width: 70px; }}
-    #sysinfo-val  {{ font-size: 13px; color: {T.get('text','#cdd6f4')}; }}
-    #media-title-w  {{ font-size: 14px; font-weight: bold;
-                       color: {T.get('text','#cdd6f4')};
-                       text-shadow: 0 1px 4px rgba(0,0,0,0.9); }}
-    #media-artist-w {{ font-size: 12px;
-                       color: {T.get('subtext',T.get('text','#a6adc8'))};
-                       text-shadow: 0 1px 4px rgba(0,0,0,0.9); }}
-    #media-btn-w {{
+css.load_from_data(("""
+    * { font-family: 'JetBrainsMono Nerd Font', monospace; }
+    #widget-box { }
+    #wx-desktop { }
+    #wx-desk-icon { font-size: 28px; text-shadow: 0 1px 6px rgba(0,0,0,0.9); }
+    #wx-desk-temp { font-size: 20px; font-weight: bold;
+                    text-shadow: 0 1px 6px rgba(0,0,0,0.9); }
+    #wx-desk-desc { font-size: 14px;
+                    text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
+    #clock-time   { font-size: 72px; font-weight: bold;
+                    text-shadow: 0 2px 8px rgba(0,0,0,0.8); }
+    #clock-date   { font-size: 18px;
+                    text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+    #sysinfo-icon { font-size: 13px; min-width: 70px; }
+    #sysinfo-val  { font-size: 13px; }
+    #media-title-w  { font-size: 14px; font-weight: bold;
+                      text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
+    #media-artist-w { font-size: 12px;
+                      text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
+    #media-btn-w {
         background-color: rgba(0,0,0,0.35); border: none; border-radius: 50%;
-        color: {T.get('text','#cdd6f4')}; font-size: 16px;
-        padding: 6px; min-width: 32px; min-height: 32px;
-    }}
-    #media-btn-w:hover {{ background-color: rgba(203,166,247,0.3); }}
-""".encode())
+        font-size: 16px; padding: 6px; min-width: 32px; min-height: 32px;
+    }
+    #media-btn-w:hover { background-color: rgba(0,0,0,0.55); }
+""" + f"""
+    #wx-desk-icon   {{ color: {_c_accent}; }}
+    #wx-desk-temp   {{ color: {_c_text}; }}
+    #wx-desk-desc   {{ color: {_c_subtext}; }}
+    #clock-time     {{ color: {_c_text}; }}
+    #clock-date     {{ color: {_c_subtext}; }}
+    #sysinfo-icon   {{ color: {_c_accent}; }}
+    #sysinfo-val    {{ color: {_c_text}; }}
+    #media-title-w  {{ color: {_c_text}; }}
+    #media-artist-w {{ color: {_c_subtext}; }}
+    #media-btn-w    {{ color: {_c_text}; }}
+""").encode())
 Gtk.StyleContext.add_provider_for_screen(
     Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -226,6 +240,27 @@ Gtk.StyleContext.add_provider_for_screen(
 enabled = WIDGET_CFG.get("enabled", ["clock"])
 widget_map = {"clock":ClockWidget, "sysinfo":SysinfoWidget, "media":MediaWidget}
 for name in enabled:
+    if name == "weather":
+        # Weather desktop widget loaded from essentials-weather
+        try:
+            import importlib.util as _iu, os as _os
+            _path = _os.path.expanduser("~/.local/bin/essentials-weather")
+            if _os.path.exists(_path):
+                loader = importlib.machinery.SourceFileLoader("essentials_weather", _path)
+                spec   = importlib.util.spec_from_loader("essentials_weather", loader)
+                mod    = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                mod = _iu.module_from_spec(spec); spec.loader.exec_module(mod)
+                _wcfg = WIDGET_CFG.get("weather",{})
+                corner = _wcfg.get("corner","bottom-center")
+                class WeatherDesktopWidget(BaseWidget):
+                    def __init__(self):
+                        super().__init__(corner=corner, margin=_wcfg.get("margin",48))
+                        self.add(mod.make_desktop_widget()); self.show_all()
+                WeatherDesktopWidget()
+        except Exception as e:
+            print(f"[widgets] weather failed: {e}")
+        continue
     cls = widget_map.get(name)
     if cls:
         try: cls()

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+essentials-idle — Idle management and screen lock on idle
+
+Wraps hypridle / swayidle / Python fallback.
+Commands: start | stop | status | config
+
+Config: ~/.config/essentials/config.json  key: "idle"
+"""
+import os, sys, json, shutil, subprocess, signal, time, importlib.util
+
+sys.path.insert(0, os.path.expanduser("~/.local/bin"))
+from essentials_lib import (
+    load_config, save_config, load_wm,
+    _run, _run_ok, BIN
+)
+
+PID_FILE = "/tmp/essentials-idle.pid"
+CFG      = load_config()
+ICFG     = CFG.get("idle", {})
+
+LOCK_AFTER    = ICFG.get("lock_after",    300)
+SCREEN_OFF    = ICFG.get("screen_off",    600)
+SUSPEND_AFTER = ICFG.get("suspend_after", 0)
+LOCK_CMD      = ICFG.get("lock_cmd", "") or f"python3 {BIN}/essentials-lockscreen"
+
+
+def _stop_existing():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.4)
+        print(f"[idle] Stopped existing daemon (pid {pid})")
+    except Exception:
+        pass
+
+def _write_pid():
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def _build_swayidle_args():
+    args = ["swayidle", "-w"]
+    lock = LOCK_CMD.split()
+    if LOCK_AFTER > 0:
+        args += ["timeout", str(LOCK_AFTER)] + lock
+    if SCREEN_OFF > 0:
+        off_cmd = ("swaymsg output '*' power off"
+                   if shutil.which("swaymsg") else "sleep 1")
+        on_cmd  = ("swaymsg output '*' power on"
+                   if shutil.which("swaymsg") else "sleep 1")
+        args += ["timeout", str(SCREEN_OFF), off_cmd, "resume", on_cmd]
+    if SUSPEND_AFTER > 0:
+        args += ["timeout", str(SUSPEND_AFTER), "systemctl suspend"]
+    args += ["before-sleep"] + lock
+    return args
+
+def _build_hypridle_conf():
+    path = os.path.expanduser("~/.config/hypr/hypridle.conf")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [
+        "general {\n",
+        f"    before_sleep_cmd = {LOCK_CMD}\n",
+        "    after_sleep_cmd  = hyprctl dispatch dpms on\n",
+        "    ignore_dbus_inhibit = false\n",
+        "}\n\n",
+    ]
+    if LOCK_AFTER > 0:
+        lines += [
+            "listener {\n",
+            f"    timeout    = {LOCK_AFTER}\n",
+            f"    on-timeout = {LOCK_CMD}\n",
+            "}\n\n",
+        ]
+    if SCREEN_OFF > 0:
+        lines += [
+            "listener {\n",
+            f"    timeout    = {SCREEN_OFF}\n",
+            "    on-timeout = hyprctl dispatch dpms off\n",
+            "    on-resume  = hyprctl dispatch dpms on\n",
+            "}\n\n",
+        ]
+    if SUSPEND_AFTER > 0:
+        lines += [
+            "listener {\n",
+            f"    timeout    = {SUSPEND_AFTER}\n",
+            "    on-timeout = systemctl suspend\n",
+            "}\n\n",
+        ]
+    with open(path, "w") as f: f.writelines(lines)
+    return path
+
+def _python_fallback():
+    """D-Bus idle time poller — last resort when no tool is installed."""
+    print("[idle] Using Python D-Bus fallback (install swayidle for better results)")
+    locked = False
+    while True:
+        time.sleep(10)
+        idle_ms = None
+        try:
+            out = subprocess.check_output([
+                "dbus-send", "--session", "--print-reply",
+                "--dest=org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver.GetSessionIdleTime",
+            ], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if "uint32" in line:
+                    idle_ms = int(line.split()[1])
+                    break
+        except Exception:
+            pass
+
+        if idle_ms is not None:
+            idle_s = idle_ms // 1000
+            if LOCK_AFTER > 0 and idle_s >= LOCK_AFTER and not locked:
+                print(f"[idle] Locking after {idle_s}s idle")
+                subprocess.Popen(LOCK_CMD.split(), stderr=subprocess.DEVNULL)
+                locked = True
+            elif idle_s < 5:
+                locked = False
+        else:
+            # No D-Bus — wall-clock lock
+            import threading
+            _t = getattr(_python_fallback, "_last_lock", 0)
+            if LOCK_AFTER > 0 and (time.time() - _t) > LOCK_AFTER:
+                subprocess.Popen(LOCK_CMD.split(), stderr=subprocess.DEVNULL)
+                _python_fallback._last_lock = time.time()
+
+
+def start():
+    _stop_existing()
+    _write_pid()
+    WM = load_wm()
+    print(f"[idle] Compositor: {WM.name}")
+    print(f"[idle] Lock:{LOCK_AFTER}s  Screen-off:{SCREEN_OFF}s  Suspend:{SUSPEND_AFTER}s")
+    print(f"[idle] Lock cmd: {LOCK_CMD}")
+
+    if shutil.which("hypridle") and WM.name == "hyprland":
+        conf = _build_hypridle_conf()
+        print(f"[idle] Using hypridle (wrote {conf})")
+        sys.exit(subprocess.run(["hypridle"]).returncode)
+
+    if shutil.which("swayidle"):
+        args = _build_swayidle_args()
+        print(f"[idle] Using swayidle")
+        sys.exit(subprocess.run(args).returncode)
+
+    _python_fallback()
+
+
+def stop():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, signal.SIGTERM)
+        os.remove(PID_FILE)
+        print(f"[idle] Stopped (pid {pid})")
+    except FileNotFoundError:
+        print("[idle] Not running")
+    except Exception as e:
+        print(f"[idle] Stop error: {e}")
+
+
+def status():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, 0)
+        print(f"[idle] Running (pid {pid})")
+    except Exception:
+        print("[idle] Not running")
+    print(f"  Lock after:    {LOCK_AFTER}s {'(disabled)' if LOCK_AFTER==0 else ''}")
+    print(f"  Screen off:    {SCREEN_OFF}s {'(disabled)' if SCREEN_OFF==0 else ''}")
+    print(f"  Suspend after: {SUSPEND_AFTER}s {'(disabled)' if SUSPEND_AFTER==0 else ''}")
+    print(f"  Lock cmd:      {LOCK_CMD}")
+    for tool in ("hypridle","swayidle"):
+        if shutil.which(tool):
+            print(f"  Backend:       {tool}")
+            break
+    else:
+        print("  Backend:       python fallback")
+
+
+def configure(**kwargs):
+    data = load_config()
+    icfg = data.get("idle", {})
+    for k, v in kwargs.items():
+        if v is not None: icfg[k] = v
+    data["idle"] = icfg
+    save_config(data)
+    print("[idle] Config saved. Restart idle daemon to apply.")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
+    if cmd == "start":   start()
+    elif cmd == "stop":  stop()
+    elif cmd == "status": status()
+    elif cmd == "config":
+        import argparse
+        p = argparse.ArgumentParser(prog="essentials-idle config")
+        p.add_argument("--lock",       type=int, dest="lock_after")
+        p.add_argument("--screen-off", type=int, dest="screen_off")
+        p.add_argument("--suspend",    type=int, dest="suspend_after")
+        a = p.parse_args(sys.argv[2:])
+        configure(lock_after=a.lock_after,
+                  screen_off=a.screen_off,
+                  suspend_after=a.suspend_after)
+    else:
+        print("Usage: essentials-idle [start|stop|status|config]")
+        sys.exit(1)

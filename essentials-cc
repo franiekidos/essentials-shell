@@ -57,6 +57,9 @@ HAS = {
     "dunstctl":     has("dunstctl"),
     "do_not_disturb": False,  # runtime state, not a tool
     "psutil":       True,  # imported at top; will fail loudly if missing
+    "cliphist":     has("cliphist"),
+    "wl-paste":     has("wl-paste"),
+    "wl-copy":      has("wl-copy"),
 }
 # Check psutil sensors (not all builds support it)
 try:
@@ -89,6 +92,8 @@ class EssentialsCC(Gtk.Window):
         self.add(inner)
 
         # ── Sections ──────────────────────────────────────────────────────────
+        inner.pack_start(self._build_weather_strip(),  False, False, 0)
+        inner.pack_start(self._sep(),                 False, False, 0)
         inner.pack_start(self._build_stats(),         False, False, 0)
         inner.pack_start(self._sep(),                 False, False, 0)
         inner.pack_start(self._build_sliders(),       False, False, 0)
@@ -122,12 +127,37 @@ class EssentialsCC(Gtk.Window):
 
     # ── Stats row ─────────────────────────────────────────────────────────────
     def _build_stats(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        # Top row: main stats
         box = Gtk.Box(spacing=10, homogeneous=True)
         self.cpu_lbl  = self._stat_card(box, "󰍛", "CPU")
         self.ram_lbl  = self._stat_card(box, "󰘚", "RAM")
         self.disk_lbl = self._stat_card(box, "󰋊", "DISK")
         self.temp_lbl = self._stat_card(box, "󰔏", "TEMP")
-        return box
+        outer.pack_start(box, False, False, 0)
+
+        # Per-core CPU row
+        core_count = len(psutil.cpu_percent(percpu=True))
+        if core_count <= 16:  # only show if manageable
+            core_box = Gtk.Box(spacing=3)
+            core_box.set_name("core-row")
+            self._core_bars = []
+            for i in range(core_count):
+                vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                bar = Gtk.ProgressBar()
+                bar.set_orientation(Gtk.Orientation.VERTICAL)
+                bar.set_inverted(True)
+                bar.set_fraction(0)
+                bar.set_name("core-bar")
+                lbl = Gtk.Label(label=str(i)); lbl.set_name("core-lbl")
+                vb.pack_start(bar, True,  True,  0)
+                vb.pack_start(lbl, False, False, 0)
+                core_box.pack_start(vb, True, True, 0)
+                self._core_bars.append(bar)
+            outer.pack_start(core_box, False, False, 0)
+
+        return outer
 
     def _stat_card(self, box, icon, name):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -293,7 +323,73 @@ class EssentialsCC(Gtk.Window):
         else:
             box.pack_start(self._unavailable("󰂯", "Bluetooth  (bluetoothctl not found)"), True, True, 0)
 
+        # Dock toggle row
+        dock_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        dock_card.set_name("toggle-card")
+        dh = Gtk.Box(spacing=8)
+        dk_icon = Gtk.Label(label="󰣉"); dk_icon.set_name("toggle-icon")
+        dh.pack_start(dk_icon, False, False, 0)
+        dh.pack_start(Gtk.Label(label="Dock"), False, False, 0)
+        self._dock_sw = Gtk.Switch()
+        self._dock_sw.set_active(self._dock_running())
+        self._dock_sw.set_halign(Gtk.Align.END)
+        dh.pack_end(self._dock_sw, False, False, 0)
+        dock_card.pack_start(dh, False, False, 0)
+        self._dock_sw.connect("notify::active", self._on_dock_toggle)
+        box.pack_start(dock_card, True, True, 0)
+
         return box
+
+    def _dock_running(self):
+        import subprocess as _sp
+        try:
+            _sp.check_output(["pgrep","-f","essentials-dock"], stderr=_sp.DEVNULL)
+            return True
+        except: return False
+
+    def _on_dock_toggle(self, sw, _p):
+        _osd = os.path.expanduser("~/.local/bin/essentials-dock")
+        if sw.get_active():
+            subprocess.Popen(["python3", _osd], stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["pkill","-f","essentials-dock"], stderr=subprocess.DEVNULL)
+
+    def _build_weather_strip(self):
+        """Single-line weather summary at the top of the CC."""
+        box = Gtk.Box(spacing=12); box.set_name("weather-strip")
+        self._wx_icon  = Gtk.Label(label="󰖐"); self._wx_icon.set_name("wx-icon")
+        self._wx_temp  = Gtk.Label(label="--"); self._wx_temp.set_name("wx-temp")
+        self._wx_desc  = Gtk.Label(label=""); self._wx_desc.set_name("wx-desc")
+        self._wx_loc   = Gtk.Label(label=""); self._wx_loc.set_name("wx-loc")
+        self._wx_loc.set_halign(Gtk.Align.END); self._wx_loc.set_hexpand(True)
+        box.pack_start(self._wx_icon, False, False, 0)
+        box.pack_start(self._wx_temp, False, False, 0)
+        box.pack_start(self._wx_desc, False, False, 0)
+        box.pack_end(self._wx_loc,    False, False, 0)
+        self._fetch_weather_strip()
+        return box
+
+    def _fetch_weather_strip(self):
+        import threading as _th, importlib.util, importlib.machinery
+        def _do():
+            path = os.path.expanduser("~/.local/bin/essentials-weather")
+            try:
+                loader = importlib.machinery.SourceFileLoader("ew", path)
+                spec   = importlib.util.spec_from_loader("ew", loader)
+                mod    = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                d   = mod.fetch_weather()
+                sym = d.get("unit_symbol","°C")
+                from gi.repository import GLib
+                GLib.idle_add(lambda: (
+                    self._wx_icon.set_text(d.get("icon","󰖐")),
+                    self._wx_temp.set_text(f"{d['temp']}{sym}"),
+                    self._wx_desc.set_text(d.get("description","")),
+                    self._wx_loc.set_text(d.get("location_name","")[:16]),
+                    False)[-1])
+            except Exception as e:
+                print(f"[cc] weather strip: {e}")
+        _th.Thread(target=_do, daemon=True).start()
 
     def _wifi_enabled(self):
         if not HAS["nmcli"]: return False
@@ -431,7 +527,33 @@ class EssentialsCC(Gtk.Window):
         box.pack_start(scroll, False, False, 0)
 
         self._load_notifications()
+
+        # Clipboard history (cliphist)
+        box.pack_start(self._sep(), False, False, 0)
+        box.pack_start(self._build_clipboard(), False, False, 0)
         return box
+
+    def _build_clipboard(self):
+        clip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        chdr = Gtk.Box(spacing=8)
+        clbl = self._section_lbl("󰅇  Clipboard")
+        clr  = Gtk.Button(label="Wipe"); clr.set_name("notif-clear-btn")
+        clr.connect("clicked", self._clear_clipboard)
+        chdr.pack_start(clbl, True,  True,  0)
+        chdr.pack_end(clr,    False, False, 0)
+        clip_box.pack_start(chdr, False, False, 0)
+
+        cscroll = Gtk.ScrolledWindow()
+        cscroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        cscroll.set_min_content_height(10)
+        cscroll.set_max_content_height(140)
+        self._clip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cscroll.add(self._clip_box)
+        clip_box.pack_start(cscroll, False, False, 0)
+
+        self._load_clipboard()
+        return clip_box
 
     def _get_notifications(self):
         """Try makoctl then dunstctl for notification history."""
@@ -472,9 +594,13 @@ class EssentialsCC(Gtk.Window):
         if sw.get_active():
             if HAS["makoctl"]:  run_ok("makoctl","set-mode","do-not-disturb")
             if HAS["dunstctl"]: run_ok("dunstctl","set-paused","true")
+            # Pause idle daemon while DND is on
+            run_ok("pkill","-STOP","-f","essentials-idle")
         else:
             if HAS["makoctl"]:  run_ok("makoctl","set-mode","default")
             if HAS["dunstctl"]: run_ok("dunstctl","set-paused","false")
+            # Resume idle daemon
+            run_ok("pkill","-CONT","-f","essentials-idle")
 
     def _load_notifications(self):
         for c in self.notif_box.get_children():
@@ -509,6 +635,51 @@ class EssentialsCC(Gtk.Window):
         if HAS["makoctl"]:   run_ok("makoctl", "dismiss", "--all")
         if HAS["dunstctl"]:  run_ok("dunstctl", "close-all")
         self._load_notifications()
+
+    def _load_clipboard(self):
+        for c in self._clip_box.get_children(): self._clip_box.remove(c)
+        if not HAS["cliphist"]:
+            lbl = Gtk.Label(label="cliphist not installed")
+            lbl.set_name("notif-empty"); lbl.set_halign(Gtk.Align.START)
+            self._clip_box.pack_start(lbl, False, False, 0)
+            self._clip_box.show_all()
+            return
+        entries = run("cliphist", "list").splitlines()[:12]
+        if not entries:
+            lbl = Gtk.Label(label="Clipboard is empty")
+            lbl.set_name("notif-empty"); lbl.set_halign(Gtk.Align.START)
+            self._clip_box.pack_start(lbl, False, False, 0)
+        for entry in entries:
+            # cliphist format: "ID	content"
+            parts  = entry.split("	", 1)
+            cid    = parts[0].strip() if len(parts) > 1 else ""
+            text   = parts[1] if len(parts) > 1 else entry
+            row    = Gtk.Box(spacing=8); row.set_name("notif-row")
+            lbl    = Gtk.Label(label=text[:60] + ("…" if len(text) > 60 else ""))
+            lbl.set_name("notif-body"); lbl.set_halign(Gtk.Align.START)
+            lbl.set_hexpand(True); lbl.set_ellipsize(3)
+            copy_btn = Gtk.Button(label="󰆏"); copy_btn.set_name("notif-clear-btn")
+            copy_btn.connect("clicked", lambda _, e=entry: self._paste_clip(e))
+            row.pack_start(lbl,      True,  True,  0)
+            row.pack_start(copy_btn, False, False, 0)
+            self._clip_box.pack_start(row, False, False, 0)
+        self._clip_box.show_all()
+
+    def _paste_clip(self, entry):
+        """Decode and paste a cliphist entry."""
+        try:
+            proc = subprocess.Popen(["cliphist", "decode"],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            out, _ = proc.communicate(entry.encode())
+            if HAS["wl-copy"]:
+                subprocess.run(["wl-copy"], input=out, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[cc] clip paste: {e}")
+
+    def _clear_clipboard(self, *_):
+        if HAS["cliphist"]: run_ok("cliphist", "wipe")
+        self._load_clipboard()
 
     # ── Action row ────────────────────────────────────────────────────────────
     def _build_actions(self):
@@ -783,6 +954,20 @@ class EssentialsCC(Gtk.Window):
                 font-size: 12px;
                 color:     {C['subtext']};
             }}
+
+            /* Per-core bars */
+            #core-row {{
+                background-color: {C['surface']};
+                border:           1px solid {C['surface2']};
+                border-radius:    10px;
+                padding:          6px 10px;
+                min-height:       48px;
+            }}
+            #core-bar trough  {{ background-color: {C['surface2']};
+                                 min-width: 8px; border-radius: 3px; }}
+            #core-bar progress {{ background-color: {C['accent']};
+                                  border-radius: 3px; }}
+            #core-lbl {{ font-size: 8px; color: {C['subtext']}; }}
 
             /* Scrollbar */
             scrollbar {{ background-color: transparent; min-width: 4px; }}

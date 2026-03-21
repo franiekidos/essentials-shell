@@ -62,6 +62,7 @@ BINS=(
     essentials-theme-apply essentials-config-writer
     essentials-osd essentials-wallpaper essentials-lockscreen
     essentials-widgets essentials-wizard
+    essentials-dock essentials-idle essentials-clipboard essentials-weather
 )
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -569,6 +570,20 @@ os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path,"w") as f: json.dump(data, f, indent=4)
 PYEOF
 ok "Bar style: $CHOSEN_STYLE"
+
+# Auto-hide
+if ask "Enable bar auto-hide? (slides offscreen when not hovered)" n; then
+    "$PY" << PYEOF
+import json, os
+path = os.path.expanduser("$DEST_CFG/config.json")
+try:
+    with open(path) as f: data = json.load(f)
+except: data = {}
+data["bar_autohide"] = True
+with open(path,"w") as f: json.dump(data, f, indent=4)
+PYEOF
+    ok "Auto-hide enabled"
+fi
 
 # ── Widgets ───────────────────────────────────────────────────────
 section "Desktop widgets"

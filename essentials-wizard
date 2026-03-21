@@ -26,10 +26,12 @@ def _load_wm():
     path = os.path.expanduser("~/.local/bin/essentials-detect")
     if os.path.exists(path):
         try:
-            spec = importlib.util.spec_from_file_location("essentials_detect", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-                return mod.detect()
+            loader = importlib.machinery.SourceFileLoader("essentials_detect", path)
+            spec   = importlib.util.spec_from_loader("essentials_detect", loader)
+            mod    = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+            return mod.detect()
         except: pass
     class _FB:
         name = "generic"
@@ -89,6 +91,9 @@ class Wizard(Gtk.Window):
             self._page_theme,
             self._page_bar_style,
             self._page_widgets,
+            self._page_dock,
+            self._page_idle,
+            self._page_weather,
             self._page_tools,
             self._page_finish,
         ]
@@ -264,6 +269,109 @@ class Wizard(Gtk.Window):
         enabled = [n for n, cb in self._widget_cbs.items() if cb.get_active()]
         _save_config({"widgets": {"enabled": enabled}})
 
+    def _page_dock(self):
+        self._heading("Dock",
+            "A Noctalia-style taskbar dock at the bottom of your screen.")
+        row = Gtk.Box(spacing=12); row.set_name("theme-row")
+        lbl = Gtk.Label(label="󰣉  Enable dock on startup"); lbl.set_name("theme-text")
+        self._dock_cb = Gtk.CheckButton(); self._dock_cb.set_active(False)
+        row.pack_start(lbl, True, True, 0)
+        row.pack_end(self._dock_cb, False, False, 10)
+        self._content.pack_start(row, False, False, 0)
+        note = Gtk.Label(label="Configure pinned apps after setup via Settings → Dock")
+        note.set_name("wiz-sub"); note.set_halign(Gtk.Align.START)
+        self._content.pack_start(note, False, False, 4)
+
+    def _collect_5(self):
+        if self._dock_cb.get_active():
+            try:
+                with open(CONFIG_PATH) as f: data = json.load(f)
+            except: data = {}
+            data.setdefault("dock",{})["enabled"] = True
+            with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+    def _page_idle(self):
+        self._heading("Idle & Lock",
+            "Automatically lock the screen after inactivity.")
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._content.pack_start(vbox, False, False, 0)
+
+        # Enable toggle
+        en_row = Gtk.Box(spacing=12); en_row.set_name("theme-row")
+        en_lbl = Gtk.Label(label="󰌾  Enable screen lock on idle"); en_lbl.set_name("theme-text")
+        self._idle_en = Gtk.CheckButton(); self._idle_en.set_active(True)
+        en_row.pack_start(en_lbl, True, True, 0)
+        en_row.pack_end(self._idle_en, False, False, 10)
+        vbox.pack_start(en_row, False, False, 0)
+
+        # Lock timeout
+        lock_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        lock_lbl_row = Gtk.Box(spacing=10)
+        lock_lbl = Gtk.Label(label="Lock after (seconds)"); lock_lbl.set_halign(Gtk.Align.START)
+        lock_lbl.set_hexpand(True)
+        self._idle_lock_val = Gtk.Label(label="300s"); self._idle_lock_val.set_name("wiz-sub")
+        lock_lbl_row.pack_start(lock_lbl, True, True, 0)
+        lock_lbl_row.pack_end(self._idle_lock_val, False, False, 0)
+        self._idle_lock_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 60, 1800, 60)
+        self._idle_lock_scale.set_value(300); self._idle_lock_scale.set_draw_value(False)
+        self._idle_lock_scale.connect("value-changed", lambda w:
+            self._idle_lock_val.set_text(f"{int(w.get_value())}s"))
+        lock_box.pack_start(lock_lbl_row, False, False, 0)
+        lock_box.pack_start(self._idle_lock_scale, False, False, 0)
+        vbox.pack_start(lock_box, False, False, 0)
+
+    def _collect_6(self):
+        if not self._idle_en.get_active(): return
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        data["idle"] = {
+            "lock_after":    int(self._idle_lock_scale.get_value()),
+            "screen_off":    int(self._idle_lock_scale.get_value()) * 2,
+            "suspend_after": 0,
+        }
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+    def _page_weather(self):
+        self._heading("Weather",
+            "Show live weather in the CC and optionally in the bar.")
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._content.pack_start(vbox, False, False, 0)
+
+        loc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        loc_lbl = Gtk.Label(label="Your city (or leave blank to disable):")
+        loc_lbl.set_halign(Gtk.Align.START); loc_lbl.set_name("wiz-sub")
+        self._wx_loc_entry = Gtk.Entry()
+        self._wx_loc_entry.set_placeholder_text("e.g. Warsaw, Tokyo, New York")
+        loc_box.pack_start(loc_lbl, False, False, 0)
+        loc_box.pack_start(self._wx_loc_entry, False, False, 0)
+        vbox.pack_start(loc_box, False, False, 0)
+
+        bar_row = Gtk.Box(spacing=12); bar_row.set_name("theme-row")
+        bar_lbl = Gtk.Label(label="󰖙  Show weather in bar"); bar_lbl.set_name("theme-text")
+        self._wx_bar_cb = Gtk.CheckButton(); self._wx_bar_cb.set_active(False)
+        bar_row.pack_start(bar_lbl, True, True, 0)
+        bar_row.pack_end(self._wx_bar_cb, False, False, 10)
+        vbox.pack_start(bar_row, False, False, 0)
+
+        note = Gtk.Label(label="Uses Open-Meteo — no account or API key needed.")
+        note.set_name("wiz-sub"); note.set_halign(Gtk.Align.START)
+        vbox.pack_start(note, False, False, 0)
+
+    def _collect_7(self):
+        loc = self._wx_loc_entry.get_text().strip()
+        if not loc: return
+        try:
+            with open(CONFIG_PATH) as f: data = json.load(f)
+        except: data = {}
+        data["weather"] = {
+            "location":    loc,
+            "units":       "celsius",
+            "provider":    "open-meteo",
+            "show_in_bar": self._wx_bar_cb.get_active(),
+        }
+        with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
     def _page_tools(self):
         self._heading("Optional Tools",
             "These tools unlock extra features. Install any that are missing.")
@@ -308,15 +416,24 @@ class Wizard(Gtk.Window):
 
     def _launch(self, _=None):
         open(DONE_FLAG,"w").write("done")
-        # Write OSD keybinds into compositor config
         self._write_osd_keybinds()
-        # Start widgets if any enabled
         cfg = {}
         try:
             with open(CONFIG_PATH) as f: cfg = json.load(f)
         except: pass
+        # Start widgets
         if cfg.get("widgets",{}).get("enabled"):
             subprocess.Popen(["python3", f"{BIN}/essentials-widgets"])
+        # Start dock
+        if cfg.get("dock",{}).get("enabled"):
+            subprocess.Popen(["python3", f"{BIN}/essentials-dock"])
+        # Start idle daemon
+        if cfg.get("idle",{}).get("lock_after",0) > 0:
+            subprocess.Popen(["python3", f"{BIN}/essentials-idle", "start"])
+        # Prime weather cache in background
+        if cfg.get("weather",{}).get("location"):
+            subprocess.Popen(["python3", f"{BIN}/essentials-weather","--fetch"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.Popen(["python3", f"{BIN}/essentials-bars"])
         Gtk.main_quit()
 

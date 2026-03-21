@@ -1,39 +1,52 @@
 #!/usr/bin/env python3
 """
-essentials-bars
+essentials-bars  —  Essentials Shell bar
 
-Five genuinely distinct bar styles:
+Five bar styles:
+  trilands  – 3 floating pills (default)
+  islands   – 1 compact centred pill
+  still     – full-width flat classic taskbar
+  floating  – full-width floating bar with side margins
+  blocks    – 3 rectangular windows at the BOTTOM
 
-  trilands  – 3 separate floating pill windows  (default)
-  islands   – 1 small centered floating window (all sections merged, compact)
-  still     – 1 full-width edge-to-edge flat bar (classic taskbar, opaque)
-  floating  – 1 full-width floating bar with side margins (rounded, semi-transparent)
-  blocks    – 3 rectangular windows anchored to the BOTTOM of the screen
+Config:  ~/.config/essentials/config.json
+  bar_style   : trilands | islands | still | floating | blocks
+  bar_autohide: true | false
+  bar         : { left:[…], center:[…], right:[…] }
+
+Available widget IDs:
+  launcher · wm-badge · workspaces · clock · date · media
+  cpu · ram · temp · disk · battery · network · volume
+  updates · weather · percore · clipboard
+  cc-button · power-button · lock · wallpaper · separator
 """
-import gi, os, json, subprocess, importlib.util, psutil, datetime, re
+import gi, os, sys, json, subprocess, importlib.util, psutil, datetime, re, shutil
 gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import Gtk, GtkLayerShell, GLib, Gdk
 
 CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+THEME_PATH  = os.path.expanduser("~/.config/essentials/themes.json")
 BIN         = os.path.expanduser("~/.local/bin")
+DONE_FLAG   = os.path.expanduser("~/.config/essentials/.wizard_done")
 
 # ── Compositor abstraction ────────────────────────────────────────────────────
 def _load_wm():
-    path = os.path.expanduser("~/.local/bin/essentials-detect")
+    path = os.path.join(BIN, "essentials-detect")
     if os.path.exists(path):
         try:
-            spec = importlib.util.spec_from_file_location("essentials_detect", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod.detect()
+            loader = importlib.machinery.SourceFileLoader("essentials_detect", path)
+            spec   = importlib.util.spec_from_loader("essentials_detect", loader)
+            mod    = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod.detect()
         except Exception as e:
-            print(f"[bars] detect failed: {e}")
+            print(f"[bars] detect: {e}")
     class _FB:
         name = "generic"
         def get_active_workspace(self): return 1
         def get_workspace_count(self):  return 4
+        def get_config_path(self):      return None
     return _FB()
 
 WM = _load_wm()
@@ -46,75 +59,104 @@ def _load_config():
 
 def _load_theme():
     try:
-        data    = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
-        current = data.get("current", "catppuccin")
-        return data.get(current, data.get("catppuccin", {}))
+        data = json.load(open(THEME_PATH))
+        cur  = data.get("current", "catppuccin")
+        return data.get(cur, data.get("catppuccin", {}))
     except:
         return {"bg":"rgba(17,17,27,0.92)","accent":"#cba6f7",
                 "text":"#cdd6f4","radius":"10px"}
 
-CFG    = _load_config()
-T      = _load_theme()
-LAYOUT = CFG.get("bar", {
+CFG        = _load_config()
+T          = _load_theme()
+STYLE_NAME = CFG.get("bar_style", "trilands")
+AUTOHIDE   = CFG.get("bar_autohide", False)
+LAYOUT     = CFG.get("bar", {
     "left":   ["launcher","wm-badge","workspaces"],
     "center": ["media","clock"],
     "right":  ["network","cpu","ram","cc-button"],
 })
 
-STYLE_NAME = CFG.get("bar_style", "trilands")
-
 def _run(*cmd, fallback=""):
-    try:    return subprocess.check_output(list(cmd), text=True,
-                                           stderr=subprocess.DEVNULL).strip()
+    try:    return subprocess.check_output(
+                list(cmd), text=True, stderr=subprocess.DEVNULL).strip()
     except: return fallback
 
-def _coerce_bg(base, alpha):
-    if alpha is None: return base
-    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", base)
-    if m: return f"rgba({m.group(1)},{m.group(2)},{m.group(3)},{alpha})"
-    return base
+def _popen(*cmd):
+    try:    subprocess.Popen(list(cmd), stderr=subprocess.DEVNULL)
+    except Exception as e: print(f"[bars] popen {cmd[0]}: {e}")
+
+def _hex_from_rgba(raw):
+    """rgba(r,g,b,...) → 'rrggbb' string, or None."""
+    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", raw)
+    return "{:02x}{:02x}{:02x}".format(
+        int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 # ── Widget factory ────────────────────────────────────────────────────────────
-# All widget updates are deferred via GLib.idle_add — nothing runs
-# synchronously during window construction to prevent re-entrancy / recursion.
-
 class WidgetFactory:
+    """
+    Builds bar widgets. All data updates deferred via idle_add / timeout_add
+    so nothing blocks during window construction.
+    """
+
     @staticmethod
     def _defer(fn):
-        """Run fn() once after the main loop starts. Never repeats."""
         def _cb():
-            try: fn()
-            except Exception as e: print(f"[bar] {e}")
-            return False   # explicit False — one shot
+            try:    fn()
+            except Exception as e: print(f"[bar widget] {e}")
+            return False
         GLib.idle_add(_cb)
 
     @staticmethod
     def _repeat(ms, fn):
-        """Run fn() on a recurring timer, first tick deferred until after show_all."""
         def _tick():
-            try: fn()
-            except Exception as e: print(f"[bar] {e}")
-            return True    # explicit True — keep repeating
-        def _start():
-            GLib.timeout_add(ms, _tick)
-            return False   # explicit False — idle fires once then stops
-        GLib.idle_add(_start)
+            try:    fn()
+            except Exception as e: print(f"[bar widget] {e}")
+            return True
+        GLib.idle_add(lambda: (GLib.timeout_add(ms, _tick), False)[1])
 
     def build(self, wid):
         fn = getattr(self, "_w_" + wid.replace("-","_"), None)
         return fn() if fn else None
 
+    # ── Launcher ──────────────────────────────────────────────────────────────
     def _w_launcher(self):
         b = Gtk.Button(label="󰣇"); b.set_name("bar-launcher")
-        b.connect("clicked", lambda _: subprocess.Popen(["python3",f"{BIN}/essentials-launcher"]))
+        b.set_tooltip_text("App launcher")
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-launcher"))
         return b
 
+    # ── WM badge ──────────────────────────────────────────────────────────────
     def _w_wm_badge(self):
-        l = Gtk.Label(label=WM.name[:5].upper()); l.set_name("wm-badge"); return l
+        l = Gtk.Label(label=WM.name[:5].upper()); l.set_name("wm-badge")
+        l.set_tooltip_text(f"Compositor: {WM.name}")
+        return l
 
+    # ── Workspaces (scroll wheel switches) ────────────────────────────────────
     def _w_workspaces(self):
-        if WM.name not in ("hyprland","niri","sway"): return None
+        if WM.name not in ("hyprland","niri","sway"):
+            return None
         box = Gtk.Box(spacing=5); box.set_name("ws-box")
+        box.add_events(Gdk.EventMask.SCROLL_MASK)
+
+        def _switch(direction):
+            if WM.name == "hyprland":
+                cmd = ["hyprctl","dispatch",
+                       "workspace","e+1" if direction > 0 else "e-1"]
+                subprocess.run(cmd, stderr=subprocess.DEVNULL)
+            elif WM.name == "sway":
+                subprocess.run(
+                    ["swaymsg","workspace","next" if direction > 0 else "prev"],
+                    stderr=subprocess.DEVNULL)
+
+        def on_scroll(w, event):
+            if event.direction == Gdk.ScrollDirection.DOWN: _switch(1)
+            elif event.direction == Gdk.ScrollDirection.UP:  _switch(-1)
+            elif event.direction == Gdk.ScrollDirection.SMOOTH:
+                if event.delta_y > 0: _switch(1)
+                elif event.delta_y < 0: _switch(-1)
+
+        box.connect("scroll-event", on_scroll)
+
         def upd():
             for c in box.get_children(): box.remove(c)
             try:    active, count = WM.get_active_workspace(), WM.get_workspace_count()
@@ -124,125 +166,460 @@ class WidgetFactory:
                 l.set_name("ws-active" if i==active else "ws-idle")
                 box.pack_start(l, False, False, 0)
             box.show_all()
-        self._defer(upd); self._repeat(500, upd); return box
 
+        self._defer(upd); self._repeat(500, upd)
+        return box
+
+    # ── Clock (updates every second, tooltip shows date) ──────────────────────
     def _w_clock(self):
         l = Gtk.Label(); l.set_name("bar-clock")
-        def upd(): l.set_text(datetime.datetime.now().strftime("󰥔 %H:%M"))
-        self._defer(upd); self._repeat(5000, upd); return l
+        def upd():
+            now = datetime.datetime.now()
+            l.set_text(now.strftime("󰥔 %H:%M"))
+            l.set_tooltip_text(now.strftime("%A, %d %B %Y"))
+        self._defer(upd); self._repeat(1000, upd)
+        return l
 
+    # ── Date ──────────────────────────────────────────────────────────────────
+    def _w_date(self):
+        l = Gtk.Label(); l.set_name("bar-stat")
+        def upd():
+            l.set_text(datetime.datetime.now().strftime("󰃭 %d %b"))
+        self._defer(upd); self._repeat(60000, upd)
+        return l
+
+    # ── Media (click opens CC, tooltip shows full title) ──────────────────────
     def _w_media(self):
-        l = Gtk.Label(); l.set_name("bar-media")
+        btn = Gtk.Button(); btn.set_name("bar-media-btn")
+        lbl = Gtk.Label(); lbl.set_name("bar-media")
+        btn.add(lbl)
+        btn.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-cc"))
+
         def upd():
             title = _run("playerctl","metadata","title")
             if title:
-                icon = "󰏤" if _run("playerctl","status") == "Playing" else "󰐊"
-                l.set_text(f"{icon} {title[:22]}{'…' if len(title)>22 else ''}")
+                status = _run("playerctl","status", fallback="Stopped")
+                icon   = "󰏤" if status == "Playing" else "󰐊"
+                short  = title[:26] + ("…" if len(title)>26 else "")
+                lbl.set_text(f"{icon} {short}")
+                btn.set_tooltip_text(f"{title}  [{_run('playerctl','metadata','artist')}]")
             else:
-                l.set_text("")
-        self._defer(upd); self._repeat(2000, upd); return l
+                lbl.set_text("")
+                btn.set_tooltip_text("")
 
+        self._defer(upd); self._repeat(2000, upd)
+        return btn
+
+    # ── CPU (click opens CC) ──────────────────────────────────────────────────
     def _w_cpu(self):
         l = Gtk.Label(); l.set_name("bar-stat")
-        def upd(): l.set_text(f"󰍛 {int(psutil.cpu_percent())}%")
-        self._defer(upd); self._repeat(3000, upd); return l
+        l.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        l.connect("button-press-event",
+                  lambda *_: _popen("python3", f"{BIN}/essentials-cc"))
+        def upd():
+            pct = int(psutil.cpu_percent())
+            l.set_text(f"󰍛 {pct}%")
+            l.set_tooltip_text(f"CPU: {pct}%  ({psutil.cpu_count()} cores)")
+        self._defer(upd); self._repeat(3000, upd)
+        return l
 
+    # ── RAM (tooltip with detail) ─────────────────────────────────────────────
     def _w_ram(self):
         l = Gtk.Label(); l.set_name("bar-stat")
-        def upd(): l.set_text(f"󰘚 {int(psutil.virtual_memory().percent)}%")
-        self._defer(upd); self._repeat(5000, upd); return l
+        def upd():
+            vm  = psutil.virtual_memory()
+            pct = int(vm.percent)
+            used_gb = vm.used / 1e9
+            total_gb= vm.total / 1e9
+            l.set_text(f"󰘚 {pct}%")
+            l.set_tooltip_text(f"RAM: {used_gb:.1f} / {total_gb:.1f} GB")
+        self._defer(upd); self._repeat(5000, upd)
+        return l
 
+    # ── Temp ──────────────────────────────────────────────────────────────────
     def _w_temp(self):
         l = Gtk.Label(); l.set_name("bar-stat")
         def upd():
             try:
-                t = next(iter(psutil.sensors_temperatures().values()))[0].current
-                l.set_text(f"󰔏 {int(t)}°")
+                temps = psutil.sensors_temperatures()
+                # Prefer coretemp/k10temp/cpu_thermal
+                for key in ("coretemp","k10temp","cpu_thermal","acpitz"):
+                    if key in temps:
+                        t = temps[key][0].current
+                        high = temps[key][0].high or 90
+                        l.set_text(f"󰔏 {int(t)}°")
+                        l.set_name("bar-stat-warn" if t > high*0.85 else "bar-stat")
+                        l.set_tooltip_text(f"CPU temp: {t:.1f}°C  (high: {high}°C)")
+                        return
+                l.set_text("")
             except: l.set_text("")
-        self._defer(upd); self._repeat(10000, upd); return l
+        self._defer(upd); self._repeat(10000, upd)
+        return l
 
+    # ── Disk ──────────────────────────────────────────────────────────────────
     def _w_disk(self):
         l = Gtk.Label(); l.set_name("bar-stat")
         def upd():
-            try:    l.set_text(f"󰋊 {int(psutil.disk_usage('/').percent)}%")
+            try:
+                du  = psutil.disk_usage("/")
+                pct = int(du.percent)
+                free_gb = du.free / 1e9
+                l.set_text(f"󰋊 {pct}%")
+                l.set_name("bar-stat-warn" if pct > 85 else "bar-stat")
+                l.set_tooltip_text(f"Disk: {free_gb:.0f} GB free")
             except: l.set_text("")
-        self._defer(upd); self._repeat(30000, upd); return l
+        self._defer(upd); self._repeat(30000, upd)
+        return l
 
+    # ── Battery (color changes near empty) ────────────────────────────────────
     def _w_battery(self):
         l = Gtk.Label(); l.set_name("bar-stat")
         def upd():
             try:
                 b = psutil.sensors_battery()
-                if b:
-                    icon = "󰂄" if b.power_plugged else ("󰁹" if b.percent>20 else "󰁺")
-                    l.set_text(f"{icon} {int(b.percent)}%")
-                else: l.set_text("")
+                if not b: l.set_text(""); return
+                pct = int(b.percent)
+                if b.power_plugged:
+                    icon = "󰂄"; style = "bar-stat"
+                elif pct <= 10:
+                    icon = "󰁺"; style = "bar-stat-crit"
+                elif pct <= 25:
+                    icon = "󰁻"; style = "bar-stat-warn"
+                elif pct <= 50:
+                    icon = "󰁽"; style = "bar-stat"
+                elif pct <= 75:
+                    icon = "󰂀"; style = "bar-stat"
+                else:
+                    icon = "󰁹"; style = "bar-stat"
+                l.set_text(f"{icon} {pct}%")
+                l.set_name(style)
+                secs = b.secsleft
+                if secs > 0 and not b.power_plugged:
+                    h, m = divmod(secs//60, 60)
+                    l.set_tooltip_text(f"Battery: {pct}%  ~{h}h{m:02d}m remaining")
+                else:
+                    l.set_tooltip_text(f"Battery: {pct}%  {'charging' if b.power_plugged else ''}")
             except: l.set_text("")
-        self._defer(upd); self._repeat(30000, upd); return l
+        self._defer(upd); self._repeat(30000, upd)
+        return l
 
+    # ── Network (click opens CC) ──────────────────────────────────────────────
     def _w_network(self):
         l = Gtk.Label(); l.set_name("bar-net")
+        l.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        l.connect("button-press-event",
+                  lambda *_: _popen("python3", f"{BIN}/essentials-cc"))
         def upd():
+            # Try nmcli wifi
             out   = _run("nmcli","-t","-f","active,ssid","dev","wifi")
             ssids = [x.split(":")[1] for x in out.splitlines() if x.startswith("yes:")]
-            l.set_text(f"󰖩 {ssids[0][:12]}" if ssids else "󰖪")
-        self._defer(upd); self._repeat(10000, upd); return l
+            if ssids:
+                l.set_text(f"󰖩 {ssids[0][:14]}")
+                l.set_tooltip_text(f"WiFi: {ssids[0]}")
+                return
+            # Try wired
+            eth = _run("nmcli","-t","-f","type,state","dev")
+            for line in eth.splitlines():
+                if "ethernet" in line and "connected" in line:
+                    l.set_text("󰈀 Wired"); l.set_tooltip_text("Ethernet connected"); return
+            l.set_text("󰖪")
+            l.set_tooltip_text("Not connected")
+        self._defer(upd); self._repeat(10000, upd)
+        return l
 
+    # ── Volume (scroll wheel adjusts) ─────────────────────────────────────────
+    def _w_volume(self):
+        l = Gtk.Label(); l.set_name("bar-stat")
+        l.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+
+        def _get_vol():
+            out = _run("wpctl","get-volume","@DEFAULT_AUDIO_SINK@")
+            try:
+                muted = "[MUTED]" in out
+                val   = int(float(out.split(":")[1].strip().split()[0]) * 100)
+                return val, muted
+            except: return 50, False
+
+        def _osd(val):
+            osd = os.path.join(BIN, "essentials-osd")
+            if os.path.exists(osd):
+                _popen("python3", osd, "volume", str(val))
+
+        def upd():
+            val, muted = _get_vol()
+            if muted:
+                l.set_text("󰝟"); l.set_tooltip_text("Muted")
+            else:
+                icon = "󰕾" if val > 50 else "󰖀" if val > 0 else "󰕿"
+                l.set_text(f"{icon} {val}%"); l.set_tooltip_text(f"Volume: {val}%")
+
+        def on_scroll(w, event):
+            d = 0
+            if event.direction == Gdk.ScrollDirection.UP:   d =  5
+            elif event.direction == Gdk.ScrollDirection.DOWN: d = -5
+            elif event.direction == Gdk.ScrollDirection.SMOOTH:
+                if event.delta_y < 0: d =  5
+                elif event.delta_y > 0: d = -5
+            if d:
+                cmd = "5%+" if d > 0 else "5%-"
+                subprocess.run(["wpctl","set-volume","-l","1.0",
+                                 "@DEFAULT_AUDIO_SINK@", cmd],
+                               stderr=subprocess.DEVNULL)
+                val, _ = _get_vol()
+                _osd(val)
+                upd()
+
+        def on_click(w, event):
+            if event.button == 1:
+                subprocess.run(["wpctl","set-mute","@DEFAULT_AUDIO_SINK@","toggle"],
+                               stderr=subprocess.DEVNULL)
+                upd()
+
+        l.connect("scroll-event",       on_scroll)
+        l.connect("button-press-event", on_click)
+        self._defer(upd); self._repeat(5000, upd)
+        return l
+
+    # ── Updates ───────────────────────────────────────────────────────────────
     def _w_updates(self):
         l = Gtk.Label(); l.set_name("bar-stat")
         def upd():
             for chk, fmt in [
-                (["checkupdates"],             lambda o: f"󰚰 {len(o.splitlines())}"),
-                (["apt","list","--upgradable"],lambda o: f"󰚰 {max(0,len(o.splitlines())-1)}"),
+                (["checkupdates"],
+                 lambda o: (f"󰚰 {len(o.splitlines())}", len(o.splitlines()))),
+                (["apt","list","--upgradable"],
+                 lambda o: (f"󰚰 {max(0,len(o.splitlines())-1)}", max(0,len(o.splitlines())-1))),
             ]:
                 out = _run(*chk)
-                if out: l.set_text(fmt(out)); return
+                if out:
+                    text, count = fmt(out)
+                    l.set_text(text)
+                    l.set_name("bar-stat-warn" if count > 20 else "bar-stat")
+                    l.set_tooltip_text(f"{count} updates available")
+                    return
             l.set_text("")
-        self._defer(upd); self._repeat(300000, upd); return l
+        self._defer(upd); self._repeat(300000, upd)
+        return l
 
+    # ── Weather ───────────────────────────────────────────────────────────────
+    def _w_weather(self):
+        path = os.path.join(BIN, "essentials-weather")
+        if os.path.exists(path):
+            try:
+                loader = importlib.machinery.SourceFileLoader("essentials_weather", path)
+                spec   = importlib.util.spec_from_loader("essentials_weather", loader)
+                mod    = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                lbl = mod.make_bar_label()
+                lbl.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+                lbl.connect("button-press-event",
+                            lambda *_: _popen("python3", path))
+                return lbl
+            except Exception as e:
+                print(f"[bars] weather: {e}")
+        l = Gtk.Label(label="󰖐"); l.set_name("bar-stat"); return l
+
+    # ── Per-core CPU ──────────────────────────────────────────────────────────
+    def _w_percore(self):
+        box  = Gtk.Box(spacing=2); box.set_name("percore-box")
+        n    = min(psutil.cpu_count(logical=True) or 4, 8)
+        bars = []
+        for _ in range(n):
+            bar = Gtk.ProgressBar()
+            bar.set_name("core-bar")
+            bar.set_orientation(Gtk.Orientation.VERTICAL)
+            bar.set_inverted(True)
+            bar.set_fraction(0)
+            bar.set_size_request(4, 22)
+            box.pack_start(bar, False, False, 0)
+            bars.append(bar)
+
+        def upd():
+            try:
+                for i, (bar, pct) in enumerate(
+                        zip(bars, psutil.cpu_percent(percpu=True))):
+                    bar.set_fraction(pct / 100)
+                box.set_tooltip_text("  ".join(
+                    f"C{i}:{int(p)}%" for i, p in
+                    enumerate(psutil.cpu_percent(percpu=True))))
+            except: pass
+
+        self._defer(upd); self._repeat(2000, upd)
+        return box
+
+    # ── Clipboard button ──────────────────────────────────────────────────────
+    def _w_clipboard(self):
+        b = Gtk.Button(label="󰅍"); b.set_name("bar-icon-btn")
+        b.set_tooltip_text("Clipboard history")
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-clipboard"))
+        return b
+
+    # ── CC / Power / Lock / Wallpaper buttons ─────────────────────────────────
     def _w_cc_button(self):
-        b = Gtk.Button(label="󰒓"); b.set_name("bar-cc-btn")
-        b.connect("clicked", lambda _: subprocess.Popen(["python3",f"{BIN}/essentials-cc"]))
+        b = Gtk.Button(label="󰒓"); b.set_name("bar-icon-btn")
+        b.set_tooltip_text("Control Centre")
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-cc"))
         return b
 
     def _w_power_button(self):
-        b = Gtk.Button(label="󰐥"); b.set_name("bar-pwr-btn")
-        b.connect("clicked", lambda _: subprocess.Popen(["python3",f"{BIN}/essentials-powermenu"]))
+        b = Gtk.Button(label="󰐥"); b.set_name("bar-icon-btn")
+        b.set_tooltip_text("Power menu")
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-powermenu"))
         return b
 
-    def _w_separator(self):
-        l = Gtk.Label(label="│"); l.set_name("bar-sep"); return l
-
-    def _w_tray(self): return None
-
     def _w_lock(self):
-        b = Gtk.Button(label="󰌾"); b.set_name("bar-pwr-btn")
+        b = Gtk.Button(label="󰌾"); b.set_name("bar-icon-btn")
         b.set_tooltip_text("Lock screen")
-        b.connect("clicked", lambda _: subprocess.Popen(
-            ["python3", f"{BIN}/essentials-lockscreen"]))
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-lockscreen"))
+        return b
+
+    def _w_dock(self):
+        b = Gtk.Button(label="󰣉"); b.set_name("bar-icon-btn")
+        b.set_tooltip_text("App dock")
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-dock"))
         return b
 
     def _w_wallpaper(self):
-        b = Gtk.Button(label="󰋩"); b.set_name("bar-cc-btn")
+        b = Gtk.Button(label="󰋩"); b.set_name("bar-icon-btn")
         b.set_tooltip_text("Wallpaper manager")
-        b.connect("clicked", lambda _: subprocess.Popen(
-            ["python3", f"{BIN}/essentials-wallpaper"]))
+        b.connect("clicked", lambda _: _popen("python3", f"{BIN}/essentials-wallpaper"))
         return b
 
+    # ── Separator ─────────────────────────────────────────────────────────────
+    def _w_separator(self):
+        l = Gtk.Label(label="│"); l.set_name("bar-sep"); return l
 
+    def _w_tray(self): return None   # future: StatusNotifierItem
+
+
+# ── Box filler ────────────────────────────────────────────────────────────────
 def _fill(box, section, spacing=8):
     f = WidgetFactory()
+    box.set_spacing(spacing)
     for wid in LAYOUT.get(section, []):
         w = f.build(wid)
         if w: box.pack_start(w, False, False, 0)
 
 
-# ── Style: trilands ───────────────────────────────────────────────────────────
-# 3 separate floating pill windows anchored top-left / top-center / top-right
+# ── Auto-hide ─────────────────────────────────────────────────────────────────
+def _setup_autohide(win, zone=46):
+    GtkLayerShell.set_exclusive_zone(win, 0)
+    state = {"timer": None, "hidden": False}
+
+    def _hide():
+        if not state["hidden"]:
+            child = win.get_child()
+            if child: child.hide()
+            state["hidden"] = True
+        return False
+
+    def _show():
+        child = win.get_child()
+        if child: child.show_all()
+        GtkLayerShell.set_exclusive_zone(win, zone)
+        state["hidden"] = False
+
+    def on_enter(w, _e):
+        if state["timer"]:
+            GLib.source_remove(state["timer"])
+            state["timer"] = None
+        _show()
+
+    def on_leave(w, _e):
+        state["timer"] = GLib.timeout_add(1500, _hide)
+
+    win.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK |
+                   Gdk.EventMask.LEAVE_NOTIFY_MASK)
+    win.connect("enter-notify-event", on_enter)
+    win.connect("leave-notify-event", on_leave)
+    GLib.timeout_add(2500, _hide)
+
+
+# ── Shared CSS ────────────────────────────────────────────────────────────────
+def _shared_css():
+    a  = T.get("accent", "#cba6f7")
+    t  = T.get("text",   "#cdd6f4")
+    s  = T.get("subtext", t)
+
+    # Derive warning/critical from theme accent hue
+    import colorsys
+    def _hex(r,g,b): return "#{:02x}{:02x}{:02x}".format(int(r*255),int(g*255),int(b*255))
+    def _parse(h):
+        h = h.lstrip("#")
+        return int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+    ar,ag,ab = _parse(a)
+    hh,hs,hv = colorsys.rgb_to_hsv(ar,ag,ab)
+    warn_col  = _hex(*colorsys.hsv_to_rgb(0.11,  max(0.6,hs), min(1,hv*1.1)))  # orange-ish
+    crit_col  = _hex(*colorsys.hsv_to_rgb(0.0,   max(0.7,hs), min(1,hv*1.1)))  # red-ish
+
+    return f"""
+    * {{
+        font-family: 'JetBrainsMono Nerd Font', monospace;
+        color: {t};
+    }}
+    window {{
+        min-height: 36px;
+    }}
+    #bar-launcher {{
+        background-color: transparent; border: none;
+        color: {a}; font-size: 20px; padding: 2px 6px;
+    }}
+    #bar-launcher:hover {{
+        background-color: rgba(255,255,255,0.08); border-radius: 8px;
+    }}
+    #wm-badge {{
+        background-color: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10); border-radius: 5px;
+        font-size: 9px; font-weight: bold; color: {s}; padding: 2px 5px;
+    }}
+    #ws-active {{ color: {a}; font-size: 14px; }}
+    #ws-idle   {{ color: rgba(255,255,255,0.20); font-size: 14px; }}
+    #bar-clock {{ font-size: 13px; font-weight: bold; }}
+    #bar-media-btn {{
+        background-color: transparent; border: none; padding: 0 4px;
+    }}
+    #bar-media-btn:hover {{
+        background-color: rgba(255,255,255,0.06); border-radius: 8px;
+    }}
+    #bar-media {{ font-size: 12px; color: {s}; }}
+    #bar-stat  {{ font-size: 12px; color: {s}; }}
+    #bar-stat-warn {{ font-size: 12px; color: {warn_col}; font-weight: bold; }}
+    #bar-stat-crit {{ font-size: 12px; color: {crit_col}; font-weight: bold; }}
+    #bar-net   {{ font-size: 12px; color: {s}; }}
+    #bar-sep   {{ font-size: 14px; color: rgba(255,255,255,0.15); margin: 0 4px; }}
+    #bar-weather {{ font-size: 12px; color: {t}; }}
+    #bar-icon-btn {{
+        background-color: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;
+        color: {a}; font-size: 15px; padding: 3px 8px;
+    }}
+    #bar-icon-btn:hover {{ background-color: rgba(255,255,255,0.13); }}
+    #percore-box {{ padding: 0 3px; }}
+    #core-bar trough  {{
+        background-color: rgba(255,255,255,0.08);
+        min-width: 4px; border-radius: 2px;
+    }}
+    #core-bar progress {{
+        background-color: {a}; border-radius: 2px;
+    }}
+    """
+
+
+# ── Style builders ────────────────────────────────────────────────────────────
+
+def _win_css(bg, border, radius):
+    return f"""
+        window {{
+            background-color: {bg};
+            border:           {border};
+            border-radius:    {radius};
+        }}
+    """.encode()
+
 
 def _build_trilands():
+    """3 floating pill windows."""
     bg = T.get("bg","rgba(17,17,27,0.92)")
-    css_extra = "border-radius: 999px;"
 
     class TriBar(Gtk.Window):
         def __init__(self, pos):
@@ -263,120 +640,105 @@ def _build_trilands():
                 GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 12)
             box = Gtk.Box(spacing=8)
             box.set_margin_start(14); box.set_margin_end(14)
-            self.add(box); _fill(box, pos); self.show_all()
+            box.set_margin_top(6);    box.set_margin_bottom(6)
+            self.add(box); _fill(box, pos)
+            self.show_all()
+            if AUTOHIDE: _setup_autohide(self)
 
     for pos in ("left","center","right"):
         TriBar(pos)
 
     p = Gtk.CssProvider()
-    p.load_from_data(f"""
-        window {{
-            background-color: {bg};
-            border: 1px solid rgba(255,255,255,0.07);
-            border-radius: 999px;
-        }}
-    """.encode())
+    p.load_from_data(_win_css(bg, "1px solid rgba(255,255,255,0.07)", "999px"))
     return p
 
 
-# ── Style: islands ────────────────────────────────────────────────────────────
-# 1 small centered window — compact, all widgets in a single pill, no left/right split
-
 def _build_islands():
+    """1 compact centred pill, all sections merged."""
     win = Gtk.Window()
     GtkLayerShell.init_for_window(win)
     GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
     GtkLayerShell.set_exclusive_zone(win, 46)
     GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
     GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, 10)
-    # No left/right anchor — compositor centres it
 
-    box = Gtk.Box(spacing=16)
+    box = Gtk.Box(spacing=14)
     box.set_margin_start(20); box.set_margin_end(20)
+    box.set_margin_top(6);    box.set_margin_bottom(6)
     win.add(box)
 
-    # Render all three sections inline with separators between them
     f = WidgetFactory()
-    sections = ["left","center","right"]
-    for i, section in enumerate(sections):
+    for i, section in enumerate(("left","center","right")):
         for wid in LAYOUT.get(section, []):
             w = f.build(wid)
             if w: box.pack_start(w, False, False, 0)
-        if i < len(sections) - 1:
+        if i < 2:
             sep = Gtk.Label(label="·"); sep.set_name("bar-sep-dot")
             box.pack_start(sep, False, False, 4)
 
     win.show_all()
+    if AUTOHIDE: _setup_autohide(win)
 
-    p = Gtk.CssProvider()
     bg = T.get("bg","rgba(17,17,27,0.92)")
-    p.load_from_data(f"""
+    p  = Gtk.CssProvider()
+    p.load_from_data((f"""
         window {{
             background-color: {bg};
             border: 1px solid {T.get('accent','#cba6f7')};
             border-radius: 999px;
         }}
-        #bar-sep-dot {{
-            color: rgba(255,255,255,0.20);
-            font-size: 16px;
-        }}
-    """.encode())
+        #bar-sep-dot {{ color: rgba(255,255,255,0.20); font-size: 16px; }}
+    """).encode())
     return p
 
 
-# ── Style: still ─────────────────────────────────────────────────────────────
-# 1 full-width edge-to-edge flat bar, opaque — classic taskbar
-
 def _build_still():
+    """Full-width flat classic taskbar, opaque, flush to edge."""
     win = Gtk.Window()
     GtkLayerShell.init_for_window(win)
     GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
     GtkLayerShell.set_exclusive_zone(win, 40)
-    for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.LEFT,
-                 GtkLayerShell.Edge.RIGHT):
+    for edge in (GtkLayerShell.Edge.TOP,
+                 GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
         GtkLayerShell.set_anchor(win, edge, True)
-    # No top margin — flush to screen edge
 
     root = Gtk.Box(spacing=0)
     root.set_margin_start(12); root.set_margin_end(12)
     win.add(root)
 
-    left_box   = Gtk.Box(spacing=10); _fill(left_box,   "left",   10)
-    center_box = Gtk.Box(spacing=10); _fill(center_box, "center", 10)
-    right_box  = Gtk.Box(spacing=10); _fill(right_box,  "right",  10)
+    left_box   = Gtk.Box(); left_box.set_margin_top(4); left_box.set_margin_bottom(4)
+    center_box = Gtk.Box(); center_box.set_margin_top(4); center_box.set_margin_bottom(4)
+    right_box  = Gtk.Box(); right_box.set_margin_top(4); right_box.set_margin_bottom(4)
+    _fill(left_box, "left", 10); _fill(center_box, "center", 10); _fill(right_box, "right", 10)
 
     root.pack_start(left_box,   False, False, 0)
     root.set_center_widget(center_box)
     root.pack_end(right_box,    False, False, 0)
     win.show_all()
+    if AUTOHIDE: _setup_autohide(win, zone=40)
 
-    # Opaque bg derived from theme — strip alpha
-    raw_bg = T.get("bg","rgba(17,17,27,0.92)")
-    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", raw_bg)
-    opaque = f"rgb({m.group(1)},{m.group(2)},{m.group(3)})" if m else raw_bg
+    raw = T.get("bg","rgba(17,17,27,0.92)")
+    m   = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", raw)
+    opaque = f"rgb({m.group(1)},{m.group(2)},{m.group(3)})" if m else raw
 
     p = Gtk.CssProvider()
     p.load_from_data(f"""
         window {{
-            background-color: {opaque};
-            border: none;
-            border-bottom: 1px solid rgba(255,255,255,0.08);
-            border-radius: 0;
+            background-color: {opaque}; border: none;
+            border-bottom: 1px solid rgba(255,255,255,0.07); border-radius: 0;
         }}
     """.encode())
     return p
 
 
-# ── Style: floating ───────────────────────────────────────────────────────────
-# 1 full-width floating bar with side margins — rounded, semi-transparent
-
 def _build_floating():
+    """Full-width floating bar with side margins."""
     win = Gtk.Window()
     GtkLayerShell.init_for_window(win)
     GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
     GtkLayerShell.set_exclusive_zone(win, 46)
-    for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.LEFT,
-                 GtkLayerShell.Edge.RIGHT):
+    for edge in (GtkLayerShell.Edge.TOP,
+                 GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
         GtkLayerShell.set_anchor(win, edge, True)
     GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP,   8)
     GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT,  20)
@@ -386,41 +748,35 @@ def _build_floating():
     root.set_margin_start(16); root.set_margin_end(16)
     win.add(root)
 
-    left_box   = Gtk.Box(spacing=10); _fill(left_box,   "left",   10)
-    center_box = Gtk.Box(spacing=10); _fill(center_box, "center", 10)
-    right_box  = Gtk.Box(spacing=10); _fill(right_box,  "right",  10)
+    left_box   = Gtk.Box(); left_box.set_margin_top(5); left_box.set_margin_bottom(5)
+    center_box = Gtk.Box(); center_box.set_margin_top(5); center_box.set_margin_bottom(5)
+    right_box  = Gtk.Box(); right_box.set_margin_top(5); right_box.set_margin_bottom(5)
+    _fill(left_box, "left", 10); _fill(center_box, "center", 10); _fill(right_box, "right", 10)
 
     root.pack_start(left_box,   False, False, 0)
     root.set_center_widget(center_box)
     root.pack_end(right_box,    False, False, 0)
     win.show_all()
+    if AUTOHIDE: _setup_autohide(win)
 
-    p = Gtk.CssProvider()
     bg = T.get("bg","rgba(17,17,27,0.92)")
-    p.load_from_data(f"""
-        window {{
-            background-color: {bg};
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 12px;
-        }}
-    """.encode())
+    p  = Gtk.CssProvider()
+    p.load_from_data(_win_css(bg, "1px solid rgba(255,255,255,0.10)", "12px"))
     return p
 
 
-# ── Style: blocks ─────────────────────────────────────────────────────────────
-# 3 rectangular windows anchored to the BOTTOM of the screen
-
 def _build_blocks():
-    raw_bg = T.get("bg","rgba(17,17,27,0.92)")
-    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", raw_bg)
-    opaque = f"rgba({m.group(1)},{m.group(2)},{m.group(3)},0.98)" if m else raw_bg
+    """3 rectangular windows at the BOTTOM of the screen."""
+    raw = T.get("bg","rgba(17,17,27,0.92)")
+    m   = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+)", raw)
+    opaque = f"rgba({m.group(1)},{m.group(2)},{m.group(3)},0.98)" if m else raw
+    accent = T.get("accent","#cba6f7")
 
     class BlockBar(Gtk.Window):
         def __init__(self, pos):
             Gtk.Window.__init__(self)
             GtkLayerShell.init_for_window(self)
             GtkLayerShell.set_layer(self, GtkLayerShell.Layer.TOP)
-            # Anchor to BOTTOM instead of top
             GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
             GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, 6)
             if pos == "left":
@@ -435,89 +791,52 @@ def _build_blocks():
                 GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 8)
             box = Gtk.Box(spacing=6)
             box.set_margin_start(10); box.set_margin_end(10)
-            self.add(box); _fill(box, pos); self.show_all()
+            box.set_margin_top(6);    box.set_margin_bottom(6)
+            self.add(box); _fill(box, pos)
+            self.show_all()
+            if AUTOHIDE: _setup_autohide(self)
 
     for pos in ("left","center","right"):
         BlockBar(pos)
 
     p = Gtk.CssProvider()
-    accent = T.get("accent","#cba6f7")
-    p.load_from_data(f"""
-        window {{
-            background-color: {opaque};
-            border: 2px solid {accent};
-            border-radius: 6px;
-        }}
-    """.encode())
+    p.load_from_data(_win_css(opaque, f"2px solid {accent}", "6px"))
     return p
 
 
-# ── Shared stylesheet (widget colours, fonts) ─────────────────────────────────
+# ── Apply shared CSS ──────────────────────────────────────────────────────────
+screen     = Gdk.Screen.get_default()
 shared_css = Gtk.CssProvider()
-shared_css.load_from_data(f"""
-    * {{
-        font-family: 'JetBrainsMono Nerd Font', monospace;
-        color: {T.get('text','#cdd6f4')};
-    }}
-    #bar-launcher {{
-        background-color: transparent; border: none;
-        color: {T.get('accent','#cba6f7')}; font-size: 20px; padding: 4px 6px;
-    }}
-    #bar-launcher:hover {{ background-color: rgba(255,255,255,0.08); border-radius: 8px; }}
-    #wm-badge {{
-        background-color: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.10); border-radius: 5px;
-        font-size: 9px; font-weight: bold;
-        color: {T.get('subtext', T.get('text','#a6adc8'))};
-        padding: 2px 5px;
-    }}
-    #ws-active {{ color: {T.get('accent','#cba6f7')}; font-size: 14px; }}
-    #ws-idle   {{ color: rgba(255,255,255,0.18);       font-size: 14px; }}
-    #bar-clock  {{ font-size: 13px; font-weight: bold; }}
-    #bar-media  {{ font-size: 12px; color: {T.get('subtext',T.get('text','#a6adc8'))}; }}
-    #bar-stat   {{ font-size: 12px; color: {T.get('subtext',T.get('text','#a6adc8'))}; }}
-    #bar-net    {{ font-size: 12px; color: {T.get('subtext',T.get('text','#a6adc8'))}; }}
-    #bar-sep    {{ font-size: 14px; color: rgba(255,255,255,0.15); margin: 0 4px; }}
-    #bar-cc-btn, #bar-pwr-btn {{
-        background-color: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;
-        color: {T.get('accent','#cba6f7')}; font-size: 16px; padding: 4px 8px;
-    }}
-    #bar-cc-btn:hover, #bar-pwr-btn:hover {{ background-color: rgba(255,255,255,0.12); }}
-""".encode())
-
-screen = Gdk.Screen.get_default()
+shared_css.load_from_data(_shared_css().encode())
 Gtk.StyleContext.add_provider_for_screen(
     screen, shared_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-# ── First-run wizard ─────────────────────────────────────────────────────────
-DONE_FLAG = os.path.expanduser("~/.config/essentials/.wizard_done")
+# ── First-run wizard ──────────────────────────────────────────────────────────
 if not os.path.exists(DONE_FLAG):
-    subprocess.Popen(["python3", f"{BIN}/essentials-wizard"])
-    # Wizard launches bars itself on finish — exit here
-    import sys; sys.exit(0)
+    _popen("python3", f"{BIN}/essentials-wizard")
+    sys.exit(0)
 
-# ── Auto-start widgets if configured ─────────────────────────────────────────
-_wcfg = CFG.get("widgets", {})
-if _wcfg.get("enabled"):
-    subprocess.Popen(["python3", f"{BIN}/essentials-widgets"])
+# ── Auto-start components from config ─────────────────────────────────────────
+if CFG.get("widgets",{}).get("enabled"):
+    _popen("python3", f"{BIN}/essentials-widgets")
+
+if CFG.get("idle",{}).get("lock_after",0) > 0:
+    _popen("python3", f"{BIN}/essentials-idle", "start")
 
 # ── Restore wallpaper ─────────────────────────────────────────────────────────
-_wall = CFG.get("wallpaper")
+_wall = CFG.get("wallpaper","")
 if _wall and os.path.exists(_wall):
-    import shutil as _sh
     for _tool, _cmd in [
-        ("swww",     ["swww","img",_wall,"--transition-type","fade"]),
-        ("swaybg",   ["swaybg","-i",_wall,"-m","fill"]),
-        ("hyprpaper",["hyprctl","hyprpaper","wallpaper",f",{_wall}"]),
-        ("feh",      ["feh","--bg-fill",_wall]),
-        ("wbg",      ["wbg",_wall]),
+        ("swww",      ["swww","img",_wall,"--transition-type","fade"]),
+        ("swaybg",    ["swaybg","-i",_wall,"-m","fill"]),
+        ("hyprpaper", ["hyprctl","hyprpaper","wallpaper",f",{_wall}"]),
+        ("feh",       ["feh","--bg-fill",_wall]),
+        ("wbg",       [_wall]),
     ]:
-        if _sh.which(_tool):
-            subprocess.Popen(_cmd, stderr=subprocess.DEVNULL)
-            break
+        if shutil.which(_tool):
+            _popen(*_cmd); break
 
-# ── Launch chosen style ───────────────────────────────────────────────────────
+# ── Launch bar style ──────────────────────────────────────────────────────────
 builders = {
     "trilands": _build_trilands,
     "islands":  _build_islands,
@@ -527,8 +846,6 @@ builders = {
 }
 
 style_css = builders.get(STYLE_NAME, _build_trilands)()
-
-# Apply the per-style window CSS at a higher priority than the shared sheet
 if style_css:
     Gtk.StyleContext.add_provider_for_screen(
         screen, style_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)

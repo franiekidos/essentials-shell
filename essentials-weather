@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+essentials-weather — Weather widget
+
+Fetches from Open-Meteo (no API key) or wttr.in.
+Caches 30 minutes at ~/.cache/essentials/weather.json.
+
+Usage:
+  essentials-weather           — open weather popup
+  essentials-weather --fetch   — fetch + print JSON, update cache, exit
+"""
+import gi, os, sys, json, threading, time
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, GtkLayerShell, GLib, Gdk
+from urllib.request import urlopen, Request
+from urllib.parse   import urlencode, quote
+from urllib.error   import URLError
+
+# Import essentials_lib if available (running standalone), else use fallbacks
+try:
+    _lib_path = os.path.expanduser("~/.local/bin")
+    if _lib_path not in sys.path:
+        sys.path.insert(0, _lib_path)
+    from essentials_lib import load_config, load_theme, apply_css, BIN
+except ImportError:
+    # Fallback when imported as a module inside bars (lib already loaded)
+    def load_config():
+        try:
+            import json
+            with open(os.path.expanduser("~/.config/essentials/config.json")) as f:
+                return json.load(f)
+        except: return {}
+    def load_theme():
+        try:
+            import json
+            data = json.load(open(os.path.expanduser("~/.config/essentials/themes.json")))
+            cur  = data.get("current","catppuccin")
+            return data.get(cur, data.get("catppuccin",{}))
+        except: return {}
+    def apply_css(css): pass
+    BIN = os.path.expanduser("~/.local/bin")
+
+CFG   = load_config()
+T     = load_theme()
+WCFG  = CFG.get("weather", {})
+LOC   = WCFG.get("location", "Warsaw")
+UNIT  = WCFG.get("units", "celsius")
+PROV  = WCFG.get("provider", "open-meteo")
+CACHE = os.path.expanduser("~/.cache/essentials/weather.json")
+TTL   = 1800   # 30 min
+
+WMO = {
+    0: ("󰖙","Clear"),    1: ("󰖙","Mainly clear"), 2: ("󰖕","Partly cloudy"),
+    3: ("󰖐","Overcast"), 45:("󰖑","Foggy"),        48:("󰖑","Icy fog"),
+    51:("󰖗","Drizzle"),  53:("󰖗","Drizzle"),      55:("󰖗","Heavy drizzle"),
+    61:("󰖖","Rain"),     63:("󰖖","Rain"),          65:("󰖖","Heavy rain"),
+    71:("󰼴","Snow"),     73:("󰼴","Snow"),          75:("󰼴","Heavy snow"),
+    80:("󰖗","Showers"),  81:("󰖗","Showers"),       82:("󰖗","Heavy showers"),
+    95:("󰖓","Thunder"),  96:("󰖓","Thunder+hail"),  99:("󰖓","Severe thunder"),
+}
+
+SYM = "°F" if UNIT == "fahrenheit" else "°C"
+
+
+def _css():
+    bg     = T.get("bg",     "rgba(17,17,27,0.92)")
+    accent = T.get("accent", T.get("accent","#cba6f7"))
+    text   = T.get("text",   T.get("text","#cdd6f4"))
+    radius = T.get("radius", "14px")
+    subtext = T.get("subtext",T.get("text","#cdd6f4"))
+    return f"""
+        #wx-root {{
+            background-color: #11111b;
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: {radius};
+            min-width: 300px;
+        }}
+        #wx-icon   {{ font-size: 52px; color: {accent}; }}
+        #wx-temp   {{ font-weight: bold; color: {text}; }}
+        #wx-desc   {{ font-size: 14px; color: {text}; }}
+        #wx-sub    {{ font-size: 12px; color: {subtext}; }}
+        #wx-detail {{ font-size: 13px; color: {text}; }}
+        #wx-btn {{
+            background-color: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 8px; padding: 8px; font-size: 13px;
+        }}
+        #wx-btn:hover {{ background-color: rgba(255,255,255,0.12); }}
+        * {{ font-family: 'JetBrainsMono Nerd Font', monospace; color: {text}; }}
+        separator {{ background-color: rgba(255,255,255,0.07); min-height: 1px; }}
+    """
+
+
+# ── Fetch logic ───────────────────────────────────────────────────────────────
+
+def _cache_ok():
+    try:
+        d = json.load(open(CACHE))
+        return (time.time() - d.get("ts", 0)) < TTL, d
+    except Exception:
+        return False, {}
+
+
+def _geocode(name):
+    url = f"https://geocoding-api.open-meteo.com/v1/search?name={quote(name)}&count=1"
+    req = Request(url, headers={"User-Agent": "essentials-shell/1.0"})
+    d   = json.loads(urlopen(req, timeout=8).read())
+    r   = d["results"][0]
+    return r["latitude"], r["longitude"], r.get("name", name)
+
+
+def _fetch_open_meteo(lat, lon):
+    params = {
+        "latitude":         lat,
+        "longitude":        lon,
+        "current_weather":  True,
+        "hourly":           "apparent_temperature,precipitation_probability",
+        "temperature_unit": "fahrenheit" if UNIT == "fahrenheit" else "celsius",
+        "windspeed_unit":   "kmh",
+        "forecast_days":    1,
+    }
+    url = "https://api.open-meteo.com/v1/forecast?" + urlencode(params)
+    req = Request(url, headers={"User-Agent": "essentials-shell/1.0"})
+    return json.loads(urlopen(req, timeout=10).read())
+
+
+def _fetch_wttr(location):
+    url = f"https://wttr.in/{quote(location)}?format=j1"
+    req = Request(url, headers={"User-Agent": "essentials-shell/1.0"})
+    return json.loads(urlopen(req, timeout=10).read())
+
+
+def fetch_weather(location=None):
+    valid, cached = _cache_ok()
+    if valid and cached.get("icon"):
+        return cached
+
+    loc = location or LOC or "Warsaw"
+    try:
+        if "," in loc and all(
+                p.replace(".", "").replace("-", "").isdigit()
+                for p in loc.split(",")):
+            lat, lon  = map(float, loc.split(","))
+            loc_name  = loc
+        else:
+            lat, lon, loc_name = _geocode(loc)
+
+        if PROV == "wttr":
+            raw = _fetch_wttr(loc)
+            cur = raw["current_condition"][0]
+            code  = int(cur.get("weatherCode", 0))
+            icon, desc = WMO.get(code, ("󰖐","Unknown"))
+            key_t = "temp_C" if UNIT == "celsius" else "temp_F"
+            key_f = "FeelsLikeC" if UNIT == "celsius" else "FeelsLikeF"
+            result = dict(
+                temp        = round(float(cur[key_t])),
+                feels_like  = round(float(cur[key_f])),
+                icon=icon, description=desc,
+                wind_kmh    = round(float(cur["windspeedKmph"])),
+                humidity    = round(float(cur["humidity"])),
+                precip_chance = 0,
+                location_name = loc_name,
+                unit_symbol = SYM, ts = time.time())
+        else:
+            raw = _fetch_open_meteo(lat, lon)
+            cw  = raw["current_weather"]
+            icon, desc = WMO.get(int(cw.get("weathercode", 0)), ("󰖐","Unknown"))
+            hourly = raw.get("hourly", {})
+            result = dict(
+                temp        = round(cw["temperature"]),
+                feels_like  = round(hourly.get("apparent_temperature", [cw["temperature"]])[0]),
+                icon=icon, description=desc,
+                wind_kmh    = round(cw["windspeed"]),
+                humidity    = 0,
+                precip_chance = round(hourly.get("precipitation_probability",[0])[0]),
+                location_name = loc_name,
+                unit_symbol = SYM, ts = time.time())
+
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as f: json.dump(result, f)
+        return result
+
+    except Exception as e:
+        print(f"[weather] fetch failed: {e}")
+        if cached.get("icon"): return cached
+        return dict(temp="?", feels_like="?", icon="󰖐",
+                    description="Unavailable", wind_kmh=0,
+                    humidity=0, precip_chance=0,
+                    location_name=loc, unit_symbol=SYM, ts=0)
+
+
+def make_bar_label():
+    """
+    Compact bar widget — called by essentials-bars WidgetFactory.
+    Deliberately avoids essentials_lib import to stay self-contained
+    when exec'd via importlib inside the running bars process.
+    """
+    # Gtk is already imported at the top of this file — safe to use directly
+    lbl = Gtk.Label(); lbl.set_name("bar-weather")
+
+    def _upd():
+        try:
+            valid, cached = _cache_ok()
+            d   = cached if (valid and cached.get("icon")) else fetch_weather()
+            sym = d.get("unit_symbol", SYM)
+            lbl.set_text(f"{d.get('icon','󰖐')} {d.get('temp','?')}{sym}")
+        except Exception as e:
+            print(f"[weather bar] {e}")
+            lbl.set_text("󰖐")
+        return True
+
+    GLib.idle_add(lambda: (_upd(), False)[1])
+    GLib.timeout_add(TTL * 1000, _upd)
+    return lbl
+
+
+# ── Popup window ──────────────────────────────────────────────────────────────
+
+class WeatherPopup(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP,   True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP,   60)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 20)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+
+        self.connect("key-press-event",
+                     lambda w,e: Gtk.main_quit() if e.keyval == Gdk.KEY_Escape else None)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("button-press-event", lambda *_: Gtk.main_quit())
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_name("wx-root"); self.add(root)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        inner.set_margin_start(24); inner.set_margin_end(24)
+        inner.set_margin_top(20);   inner.set_margin_bottom(20)
+        root.pack_start(inner, False, False, 0)
+
+        self._icon    = Gtk.Label(); self._icon.set_name("wx-icon")
+        self._temp    = Gtk.Label(); self._temp.set_name("wx-temp")
+        self._desc    = Gtk.Label(); self._desc.set_name("wx-desc")
+        self._loc     = Gtk.Label(); self._loc.set_name("wx-sub")
+        self._detail  = Gtk.Label(); self._detail.set_name("wx-detail")
+        self._status  = Gtk.Label(label="Fetching…"); self._status.set_name("wx-sub")
+
+        top = Gtk.Box(spacing=18)
+        top.pack_start(self._icon, False, False, 0)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        v.pack_start(self._temp, False, False, 0)
+        v.pack_start(self._desc, False, False, 0)
+        v.pack_start(self._loc,  False, False, 0)
+        top.pack_start(v, False, False, 0)
+        inner.pack_start(top, False, False, 0)
+        inner.pack_start(Gtk.Separator(), False, False, 0)
+        inner.pack_start(self._detail, False, False, 0)
+        inner.pack_start(self._status, False, False, 0)
+
+        btn = Gtk.Button(label="󰑓 Refresh"); btn.set_name("wx-btn")
+        btn.connect("clicked", lambda _: self._fetch())
+        inner.pack_start(btn, False, False, 0)
+
+        apply_css(_css())
+        self.set_size_request(320, -1)
+        self.show_all()
+        GLib.idle_add(self._fetch)
+
+    def _fetch(self):
+        self._status.set_text("Fetching…")
+        def _do():
+            d = fetch_weather()
+            GLib.idle_add(self._update, d)
+        threading.Thread(target=_do, daemon=True).start()
+        return False
+
+    def _update(self, d):
+        s = d.get("unit_symbol", SYM)
+        self._icon.set_text(d.get("icon","󰖐"))
+        self._temp.set_markup(
+            f"<span size='xx-large' weight='bold'>{d['temp']}{s}</span>")
+        self._desc.set_text(d.get("description",""))
+        self._loc.set_markup(
+            f"<span size='small'>󰍎 {d.get('location_name','')}</span>")
+        self._detail.set_markup(
+            f"Feels <b>{d['feels_like']}{s}</b>   "
+            f"Wind <b>{d['wind_kmh']} km/h</b>   "
+            f"Rain <b>{d['precip_chance']}%</b>")
+        stale = " (cached)" if (time.time() - d.get("ts",0)) > TTL else ""
+        self._status.set_markup(
+            f"<span size='small'>Updated{stale}</span>")
+        return False
+
+
+if __name__ == "__main__":
+    if "--fetch" in sys.argv:
+        print(json.dumps(fetch_weather(), indent=2))
+    else:
+        WeatherPopup()
+        Gtk.main()
