@@ -923,10 +923,11 @@ class EssentialsCC(Gtk.Window):
             #media-btn {{
                 background-color: transparent;
                 border:           none;
-                border-radius:    10px;
-                font-size:        28px;
+                border-radius:    8px;
+                font-size:        22px;
                 color:            {C['text']};
-                padding:          12px;
+                padding:          6px 8px;
+                min-height:       0;
             }}
             #media-btn:hover {{
                 background-color: {C['surface2']};
@@ -939,8 +940,8 @@ class EssentialsCC(Gtk.Window):
                 border:           1px solid {C['surface3']};
                 border-radius:    6px;
                 color:            {C['subtext']};
-                font-size:        11px;
-                padding:          3px 10px;
+                font-size:        10px;
+                padding:          2px 8px;
                 font-weight:      normal;
             }}
             #notif-clear-btn:hover {{
@@ -973,11 +974,12 @@ class EssentialsCC(Gtk.Window):
             #action-pwr, #action-set {{
                 background-color: {C['surface']};
                 border:           1px solid {C['surface2']};
-                border-radius:    10px;
-                padding:          16px;
-                font-size:        15px;
+                border-radius:    9px;
+                padding:          9px 10px;
+                font-size:        13px;
                 font-weight:      bold;
                 color:            {C['text']};
+                min-height:       0;
             }}
             #action-pwr:hover {{
                 background-color: rgba(243,139,168,0.18);
