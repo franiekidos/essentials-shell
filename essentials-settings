@@ -1246,6 +1246,19 @@ class EssentialsSettings(Gtk.Window):
         ah_row.pack_end(self._autohide_sw, False, False, 10)
         page.pack_start(ah_row, False, False, 0)
 
+        # Control Centre — compact buttons
+        cc_row = Gtk.Box(spacing=12); cc_row.set_name("theme-row")
+        cc_lbl = Gtk.Label(
+            label="󰒓  Compact CC buttons  (media, actions, clear)"
+        )
+        cc_lbl.set_name("theme-text")
+        self._cc_compact_sw = Gtk.Switch()
+        self._cc_compact_sw.set_active(_ah_cfg.get("cc", {}).get("compact_buttons", True))
+        self._cc_compact_sw.connect("notify::active", self._on_cc_compact_toggle)
+        cc_row.pack_start(cc_lbl, True, True, 0)
+        cc_row.pack_end(self._cc_compact_sw, False, False, 10)
+        page.pack_start(cc_row, False, False, 0)
+
         # Load current layout
         if CW:
             self._bar_layout = CW.load_bar_layout()
@@ -1376,6 +1389,16 @@ class EssentialsSettings(Gtk.Window):
         except: data = {}
         data["bar_autohide"] = sw.get_active()
         with open(CONFIG_PATH,"w") as f: json.dump(data,f,indent=4)
+
+    def _on_cc_compact_toggle(self, sw, _p):
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data.setdefault("cc", {})["compact_buttons"] = sw.get_active()
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f, indent=4)
 
     def _add_widget_dialog(self, section, store, all_widgets):
         dlg = Gtk.Dialog(title="Add Widget", parent=self, flags=Gtk.DialogFlags.MODAL)
@@ -1636,6 +1659,18 @@ class EssentialsSettings(Gtk.Window):
         ah_row.pack_end(self._dock_autohide, False, False, 10)
         page.pack_start(ah_row, False, False, 0)
 
+        # Compact buttons (tighter padding & spacing)
+        dc_row = Gtk.Box(spacing=12); dc_row.set_name("theme-row")
+        dc_lbl = Gtk.Label(
+            label="󰦥  Compact dock  (smaller buttons & padding)"
+        )
+        dc_lbl.set_name("theme-text")
+        self._dock_compact = Gtk.Switch()
+        self._dock_compact.set_active(dcfg.get("compact_buttons", True))
+        dc_row.pack_start(dc_lbl, True, True, 0)
+        dc_row.pack_end(self._dock_compact, False, False, 10)
+        page.pack_start(dc_row, False, False, 0)
+
         # Pinned apps editor
         page.pack_start(self._section("Pinned Apps"), False, False, 0)
         self._pin_store = Gtk.ListStore(str, str, str)  # name, exec, icon
@@ -1719,6 +1754,7 @@ class EssentialsSettings(Gtk.Window):
             "position": positions[idx] if 0 <= idx < len(positions) else "bottom",
             "icon_size": int(self._dock_size.get_value()),
             "autohide":  self._dock_autohide.get_active(),
+            "compact_buttons": self._dock_compact.get_active(),
             "pinned":    [{"name":r[0],"exec":r[1],"icon":r[2]}
                           for r in self._pin_store],
         }

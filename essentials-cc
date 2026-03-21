@@ -14,6 +14,19 @@ def _load_theme():
 
 T = _load_theme()
 
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+
+def _load_cc_compact():
+    """Control Centre button density: cc.compact_buttons (default True)."""
+    try:
+        with open(CONFIG_PATH) as f:
+            d = json.load(f)
+        return bool(d.get("cc", {}).get("compact_buttons", True))
+    except Exception:
+        return True
+
+
 # ── Palette (all dark, no flashbangs) ────────────────────────────────────────
 C = dict(
     bg       = "#11111b",
@@ -72,6 +85,7 @@ except Exception:
 class EssentialsCC(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self)
+        self._cc_compact = _load_cc_compact()
         self._osd_vol_timer = None
         self._osd_bri_timer = None
         self._osd_last_emit = {"volume": 0.0, "bright": 0.0}
@@ -730,7 +744,10 @@ class EssentialsCC(Gtk.Window):
 
     # ── Action row ────────────────────────────────────────────────────────────
     def _build_actions(self):
-        box = Gtk.Box(spacing=10, homogeneous=True)
+        box = Gtk.Box(
+            spacing=(6 if self._cc_compact else 10),
+            homogeneous=True,
+        )
         pwr  = Gtk.Button(label="󰐥  Power");     pwr.set_name("action-pwr")
         lock = Gtk.Button(label="󰌾  Lock");      lock.set_name("action-set")
         wall = Gtk.Button(label="󰋩  Wallpaper"); wall.set_name("action-set")
@@ -766,6 +783,53 @@ class EssentialsCC(Gtk.Window):
                 alloc.y <= y <= alloc.y + alloc.height):
             Gtk.main_quit()
         return False
+
+    def _cc_button_css(self):
+        """Extra rules for media / clear / action buttons — compact vs comfortable."""
+        c = C
+        if self._cc_compact:
+            return f"""
+            #media-btn {{
+                background-color: transparent;
+                border:           none;
+                border-radius:    8px;
+                font-size:        22px;
+                color:            {c['text']};
+                padding:          6px 8px;
+                min-height:       0;
+            }}
+            #notif-clear-btn {{
+                font-size:        10px;
+                padding:          2px 8px;
+            }}
+            #action-pwr, #action-set {{
+                border-radius:    9px;
+                padding:          9px 10px;
+                font-size:        13px;
+                min-height:       0;
+            }}
+            """
+        return f"""
+            #media-btn {{
+                background-color: transparent;
+                border:           none;
+                border-radius:    10px;
+                font-size:        28px;
+                color:            {c['text']};
+                padding:          12px;
+                min-height:       auto;
+            }}
+            #notif-clear-btn {{
+                font-size:        11px;
+                padding:          3px 10px;
+            }}
+            #action-pwr, #action-set {{
+                border-radius:    10px;
+                padding:          16px;
+                font-size:        15px;
+                min-height:       auto;
+            }}
+            """
 
     def apply_style(self):
         css = Gtk.CssProvider()
@@ -920,15 +984,6 @@ class EssentialsCC(Gtk.Window):
             #media-controls {{
                 margin-top: 4px;
             }}
-            #media-btn {{
-                background-color: transparent;
-                border:           none;
-                border-radius:    8px;
-                font-size:        22px;
-                color:            {C['text']};
-                padding:          6px 8px;
-                min-height:       0;
-            }}
             #media-btn:hover {{
                 background-color: {C['surface2']};
                 color:            {C['accent']};
@@ -940,8 +995,6 @@ class EssentialsCC(Gtk.Window):
                 border:           1px solid {C['surface3']};
                 border-radius:    6px;
                 color:            {C['subtext']};
-                font-size:        10px;
-                padding:          2px 8px;
                 font-weight:      normal;
             }}
             #notif-clear-btn:hover {{
@@ -970,17 +1023,14 @@ class EssentialsCC(Gtk.Window):
                 padding:   8px 0;
             }}
 
-            /* ── Action buttons ── */
+            /* ── Action buttons (base; size variants below) ── */
             #action-pwr, #action-set {{
                 background-color: {C['surface']};
                 border:           1px solid {C['surface2']};
-                border-radius:    9px;
-                padding:          9px 10px;
-                font-size:        13px;
                 font-weight:      bold;
                 color:            {C['text']};
-                min-height:       0;
             }}
+            {self._cc_button_css()}
             #action-pwr:hover {{
                 background-color: rgba(243,139,168,0.18);
                 border-color:     {C['red']};

@@ -279,13 +279,37 @@ essentials-detect --json   # prints: {"name":"hyprland","config":"...","plugins"
 
 | File | Purpose |
 |------|---------|
-| `~/.config/essentials/config.json` | Bar layout, style, widgets, wallpaper, locker |
+| `~/.config/essentials/config.json` | Bar layout, style, widgets, wallpaper, locker, CC options (`cc.compact_buttons`) |
 | `~/.config/essentials/themes.json` | Theme definitions |
 | `~/.config/essentials/wallpapers/` | Downloaded wallpapers |
 | `~/.config/essentials/plugins/shell/` | Shell-level plugin executables |
 | `~/.config/essentials/plugins/wm/<wm>/` | WM-specific plugin executables |
 | `~/.cache/essentials/wallhaven/` | Wallhaven thumbnail cache |
 | `~/.config/essentials/.wizard_done` | Wizard completion flag |
+
+**Control Centre — compact buttons** (optional):
+
+```json
+"cc": {
+    "compact_buttons": true
+}
+```
+
+Set `compact_buttons` to `false` for larger media controls, action row, and notification “Clear” buttons. Toggle is also in **Settings → Bar Layout**. Restart CC after changing the file manually.
+
+**Dock — compact buttons** (optional, under `dock` in the same file):
+
+```json
+"dock": {
+    "enabled": true,
+    "compact_buttons": true,
+    "icon_size": 28,
+    "position": "bottom",
+    "autohide": false
+}
+```
+
+Set `compact_buttons` to `false` for larger dock icon padding and spacing. Configure in **Settings → Dock** and restart the dock.
 
 ---
 

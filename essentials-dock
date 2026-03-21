@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """
-essentials-dock — OSD-style compact dock bar (HARDCODED)
+essentials-dock — floating dock bar
 
-Floating island-style dock that appears on demand.
-All settings are hardcoded - no config file needed.
+Configuration: ~/.config/essentials/config.json → "dock" object
+  position, icon_size, autohide, pinned, compact_buttons
 
-FIX: Keep window visible but transparent when hidden 1so hover events still work.
+Keep window visible but transparent when hidden so hover events still work.
 """
-import gi, os, sys, subprocess
+import gi, json, os, sys, subprocess
 gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import Gtk, GtkLayerShell, GLib, Gdk, Gio
 
-# ── HARDCODED SETTINGS ────────────────────────────────────────────────────────
-POS         = "bottom"          # bottom | top | left | right
-ISIZE       = 32                # Icon size in pixels
+CONFIG_PATH = os.path.expanduser("~/.config/essentials/config.json")
+
+# ── Defaults (used when config missing) ───────────────────────────────────────
 TRANSPARENCY = 0.70             # 0.0 (invisible) to 1.0 (opaque)
 TRANSPARENCY_HIDDEN = 0.15      # Transparency when hidden (still receives events)
-HIDE        = True              # Auto-hide enabled
 HIDE_DELAY  = 1000              # Milliseconds before hiding
 SHOW_DELAY  = 2000              # Milliseconds before initial hide
 MAX_RUNNING = 12                # Max running apps to show
-MARGIN      = 10                # Margin from screen edge (floating effect)
 
-# ── PINNED APPS ───────────────────────────────────────────────────────────────
-PINNED = [
+DEFAULT_PINNED = [
     {"name": "Terminal", "exec": "kitty",           "icon": "utilities-terminal"},
     {"name": "Browser",  "exec": "firefox",         "icon": "firefox"},
     {"name": "Files",    "exec": "nautilus",        "icon": "system-file-manager"},
@@ -32,38 +29,71 @@ PINNED = [
     {"name": "Settings", "exec": "gnome-control-center", "icon": "preferences-system"},
 ]
 
-VERTICAL = POS in ("left", "right")
+
+def _load_dock_cfg():
+    """Read dock section from config.json."""
+    raw = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            raw = json.load(f).get("dock", {})
+    except Exception:
+        pass
+    pos = raw.get("position", "bottom")
+    if pos not in ("bottom", "top", "left", "right"):
+        pos = "bottom"
+    pinned = raw.get("pinned")
+    if not isinstance(pinned, list) or not pinned:
+        pinned = list(DEFAULT_PINNED)
+    return {
+        "position": pos,
+        "vertical": pos in ("left", "right"),
+        "icon_size": int(raw.get("icon_size", 32)),
+        "compact": bool(raw.get("compact_buttons", True)),
+        "autohide": bool(raw.get("autohide", False)),
+        "margin": int(raw.get("margin", 10)),
+        "pinned": pinned,
+    }
+
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
-def _build_css(alpha):
+def _build_css(alpha, pos, vertical, compact):
     # Hardcoded colors (Catppuccin Mocha inspired)
     bg_r, bg_g, bg_b = 30, 30, 46
     accent      = "#cba6f7"
     text        = "#cdd6f4"
     sep_col     = "rgba(255,255,255,0.15)"
-    
-    # FIX: Proper RGBA format with dynamic alpha
+
     surface = f"rgba({bg_r},{bg_g},{bg_b},{alpha})"
     surface_hover = f"rgba(40,40,55,{min(1.0, alpha + 0.20)})"
 
-    # Border radius based on position
     radius = "16px"
-    if POS == 'top':
+    if pos == "top":
         border_radius = f"0 0 {radius} {radius}"
-    elif POS == 'bottom':
+    elif pos == "bottom":
         border_radius = f"{radius} {radius} 0 0"
-    elif POS == 'left':
+    elif pos == "left":
         border_radius = f"0 {radius} {radius} 0"
-    else:  # right
+    else:
         border_radius = f"{radius} 0 0 {radius}"
 
-    # Padding based on orientation
-    if VERTICAL:
-        padding = "10px 6px"
-        sep_style = "min-width: 1px; margin: 6px 0;"
+    if compact:
+        btn_pad, btn_rad = "4px", "8px"
+        dot_px = "5px"
+        if vertical:
+            padding = "10px 6px"
+            sep_style = "min-width: 1px; margin: 6px 0;"
+        else:
+            padding = "6px 10px"
+            sep_style = "min-height: 1px; margin: 0 6px;"
     else:
-        padding = "6px 10px"
-        sep_style = "min-height: 1px; margin: 0 6px;"
+        btn_pad, btn_rad = "8px", "10px"
+        dot_px = "7px"
+        if vertical:
+            padding = "14px 10px"
+            sep_style = "min-width: 1px; margin: 10px 0;"
+        else:
+            padding = "10px 14px"
+            sep_style = "min-height: 1px; margin: 0 10px;"
 
     return f"""
         #dock-window, window, .background {{
@@ -88,8 +118,8 @@ def _build_css(alpha):
         .dock-btn {{
             background: transparent;
             border:     none;
-            border-radius: 8px;
-            padding:    4px;
+            border-radius: {btn_rad};
+            padding:    {btn_pad};
             min-width:  0;
             min-height: 0;
         }}
@@ -98,8 +128,8 @@ def _build_css(alpha):
         .dock-win-btn {{
             background: {surface_hover};
             border:     none;
-            border-radius: 8px;
-            padding:    4px;
+            border-radius: {btn_rad};
+            padding:    {btn_pad};
             min-width:  0;
             min-height: 0;
         }}
@@ -109,7 +139,7 @@ def _build_css(alpha):
         }}
         .dock-win-btn:active {{ background-color: rgba(255,255,255,0.30); }}
         .dock-dot {{
-            font-size: 5px;
+            font-size: {dot_px};
             color: {accent};
             margin: 0;
             padding: 0;
@@ -151,7 +181,6 @@ def _icon(name, size):
 # ── Running windows ───────────────────────────────────────────────────────────
 def _get_windows():
     try:
-        import json
         result = subprocess.run(["hyprctl", "-j", "clients"], 
                                 capture_output=True, text=True, timeout=2)
         if result.returncode == 0 and result.stdout:
@@ -184,6 +213,16 @@ def _get_windows():
 class Dock(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self)
+        cfg = _load_dock_cfg()
+        self._pos = cfg["position"]
+        self._vertical = cfg["vertical"]
+        self._icon_size = max(16, min(96, cfg["icon_size"]))
+        self._compact = cfg["compact"]
+        self._autohide = cfg["autohide"]
+        self._margin = max(0, cfg["margin"])
+        self._pinned = cfg["pinned"]
+        gap = 4 if self._compact else 8
+
         self.set_name("dock-window")
         self.set_app_paintable(True)
         screen = self.get_screen()
@@ -213,41 +252,41 @@ class Dock(Gtk.Window):
             "right":  (GtkLayerShell.Edge.RIGHT,
                        GtkLayerShell.Edge.TOP,  GtkLayerShell.Edge.BOTTOM),
         }
-        primary, span_a, span_b = edge_map.get(POS, edge_map["bottom"])
+        primary, span_a, span_b = edge_map.get(self._pos, edge_map["bottom"])
         for edge in (primary, span_a, span_b):
             GtkLayerShell.set_anchor(self, edge, True)
-        
+
         # Float away from edges
-        GtkLayerShell.set_margin(self, primary, MARGIN)
-        GtkLayerShell.set_margin(self, span_a, MARGIN)
-        GtkLayerShell.set_margin(self, span_b, MARGIN)
+        GtkLayerShell.set_margin(self, primary, self._margin)
+        GtkLayerShell.set_margin(self, span_a, self._margin)
+        GtkLayerShell.set_margin(self, span_b, self._margin)
 
         # ── Layout ────────────────────────────────────────────────────────────
-        orient = Gtk.Orientation.VERTICAL if VERTICAL else Gtk.Orientation.HORIZONTAL
+        orient = Gtk.Orientation.VERTICAL if self._vertical else Gtk.Orientation.HORIZONTAL
 
         outer = Gtk.Box(orientation=orient, spacing=0)
         outer.set_name("dock-win")
         self.add(outer)
 
-        self._inner = Gtk.Box(orientation=orient, spacing=4)
+        self._inner = Gtk.Box(orientation=orient, spacing=gap)
         self._inner.set_name("dock-inner")
         outer.pack_start(self._inner, False, False, 0)
-        
-        if not VERTICAL:
+
+        if not self._vertical:
             outer.set_halign(Gtk.Align.CENTER)
         else:
             outer.set_valign(Gtk.Align.CENTER)
 
         # ── Pinned apps ───────────────────────────────────────────────────────
-        for item in PINNED:
+        for item in self._pinned:
             self._inner.pack_start(self._pinned_btn(item), False, False, 0)
 
         # ── Separator + running windows ───────────────────────────────────────
         self._sep = Gtk.Separator(
-            orientation=Gtk.Orientation.HORIZONTAL if VERTICAL
+            orientation=Gtk.Orientation.HORIZONTAL if self._vertical
                         else Gtk.Orientation.VERTICAL)
         self._sep.set_name("dock-sep")
-        self._run_box = Gtk.Box(orientation=orient, spacing=4)
+        self._run_box = Gtk.Box(orientation=orient, spacing=gap)
 
         # ── CSS ───────────────────────────────────────────────────────────────
         self._css_provider = Gtk.CssProvider()
@@ -262,8 +301,8 @@ class Dock(Gtk.Window):
         # Show then hide after delay
         self.show_all()
         self._sep.hide()
-        
-        if HIDE:
+
+        if self._autohide:
             GLib.timeout_add(SHOW_DELAY, self._do_hide)
 
         # Running window refresh
@@ -272,7 +311,8 @@ class Dock(Gtk.Window):
 
     def _apply_css(self, alpha):
         """Re-apply CSS with new transparency value"""
-        self._css_provider.load_from_data(_build_css(alpha).encode())
+        self._css_provider.load_from_data(
+            _build_css(alpha, self._pos, self._vertical, self._compact).encode())
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), 
             self._css_provider, 
@@ -291,7 +331,7 @@ class Dock(Gtk.Window):
         btn = Gtk.Button()
         btn.get_style_context().add_class("dock-btn")
         btn.set_tooltip_text(item.get("name",""))
-        btn.add(_icon(item.get("icon","application-x-executable"), ISIZE))
+        btn.add(_icon(item.get("icon","application-x-executable"), self._icon_size))
         btn.connect("clicked", lambda _, c=item.get("exec",""): self._launch_app(c))
         btn.connect("button-press-event", lambda b,ev,i=item: self._pin_menu(b, ev, i))
         return btn
@@ -300,7 +340,7 @@ class Dock(Gtk.Window):
         try:
             if cmd:
                 subprocess.Popen(cmd.split(), stderr=subprocess.DEVNULL)
-                if HIDE:
+                if self._autohide:
                     GLib.timeout_add(500, self._do_hide)
         except Exception as e:
             print(f"[dock] launch error: {e}")
@@ -343,7 +383,8 @@ class Dock(Gtk.Window):
         btn.set_tooltip_text(win["title"])
 
         overlay = Gtk.Overlay()
-        overlay.add(_icon(win.get("class",""), ISIZE - 6))
+        sm = max(16, self._icon_size - 6)
+        overlay.add(_icon(win.get("class",""), sm))
         dot = Gtk.Label(label="⬤")
         dot.get_style_context().add_class("dock-dot")
         dot.set_halign(Gtk.Align.CENTER)
@@ -358,7 +399,7 @@ class Dock(Gtk.Window):
                 if pid:
                     subprocess.run(["hyprctl","dispatch","focuswindow",f"pid:{pid}"],
                                    stderr=subprocess.DEVNULL, timeout=2)
-                if HIDE:
+                if self._autohide:
                     GLib.timeout_add(500, self._do_hide)
             except:
                 try:
@@ -412,7 +453,7 @@ class Dock(Gtk.Window):
 
     def _on_leave(self, *_):
         """Start hide timer when cursor leaves"""
-        if HIDE:
+        if self._autohide:
             self._hide_timer = GLib.timeout_add(HIDE_DELAY, self._do_hide)
 
 
