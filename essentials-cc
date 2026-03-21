@@ -640,11 +640,13 @@ class EssentialsCC(Gtk.Window):
             if HAS["dunstctl"]: run_ok("dunstctl","set-paused","true")
             # Pause idle daemon while DND is on
             run_ok("pkill","-STOP","-f","essentials-idle")
+            self._spawn_osd("notif", "dnd-on")
         else:
             if HAS["makoctl"]:  run_ok("makoctl","set-mode","default")
             if HAS["dunstctl"]: run_ok("dunstctl","set-paused","false")
             # Resume idle daemon
             run_ok("pkill","-CONT","-f","essentials-idle")
+            self._spawn_osd("notif", "dnd-off")
 
     def _load_notifications(self):
         for c in self.notif_box.get_children():
@@ -679,6 +681,7 @@ class EssentialsCC(Gtk.Window):
         if HAS["makoctl"]:   run_ok("makoctl", "dismiss", "--all")
         if HAS["dunstctl"]:  run_ok("dunstctl", "close-all")
         self._load_notifications()
+        self._spawn_osd("notif", "cleared")
 
     def _load_clipboard(self):
         for c in self._clip_box.get_children(): self._clip_box.remove(c)

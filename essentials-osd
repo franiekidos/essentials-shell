@@ -5,6 +5,7 @@ essentials-osd  — Volume & Brightness OSD
 Usage:
   essentials-osd volume   up|down|mute|<0-100>
   essentials-osd bright   up|down|<0-100>
+  essentials-osd notif    dnd-on|dnd-off|cleared|<custom-text>
 
 Shows a translucent pill OSD for 2 seconds then exits.
 Designed to be bound to media/brightness keys in your compositor config.
@@ -118,11 +119,21 @@ class OSD(Gtk.Window):
                 icon = "󰕾" if val > 50 else "󰖀" if val > 0 else "󰕿"
                 label, pct = "Volume", f"{val}%"
             fraction = 0.0 if muted else val / 100
-        else:
+        elif kind == "bright":
             val      = set_brightness(action)
             icon     = "󰃠" if val > 50 else "󰃟"
             label, pct = "Brightness", f"{val}%"
             fraction = val / 100
+        else:  # notif
+            if action == "dnd-on":
+                icon, label, pct = "󰂛", "Notifications", "Do Not Disturb"
+            elif action == "dnd-off":
+                icon, label, pct = "󰂚", "Notifications", "Enabled"
+            elif action == "cleared":
+                icon, label, pct = "󰎟", "Notifications", "Cleared"
+            else:
+                icon, label, pct = "󰂚", "Notifications", action.replace("_", " ")[:26]
+            fraction = None
 
         # ── Layout ────────────────────────────────────────────────────────────
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -140,10 +151,11 @@ class OSD(Gtk.Window):
         top.pack_end(pct_lbl,     False, False, 0)
         outer.pack_start(top, False, False, 0)
 
-        bar = Gtk.ProgressBar()
-        bar.set_fraction(fraction)
-        bar.set_name("osd-bar")
-        outer.pack_start(bar, False, False, 0)
+        if fraction is not None:
+            bar = Gtk.ProgressBar()
+            bar.set_fraction(fraction)
+            bar.set_name("osd-bar")
+            outer.pack_start(bar, False, False, 0)
 
         self._apply_style()
         self.show_all()
@@ -193,7 +205,7 @@ class OSD(Gtk.Window):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if len(args) < 2 or args[0] not in ("volume","bright"):
+    if len(args) < 2 or args[0] not in ("volume","bright","notif"):
         print(__doc__)
         sys.exit(0)
     OSD(args[0], args[1])
