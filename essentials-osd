@@ -94,11 +94,13 @@ class OSD(Gtk.Window):
     def __init__(self, kind, action):
         Gtk.Window.__init__(self)
         self.set_name("osd-win")
+        self.set_decorated(False)
+        self.set_resizable(False)
         self.set_app_paintable(True)
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual() if screen else None
-        if visual:
-            self.set_visual(visual)
+        self.connect("screen-changed", self._on_screen_changed)
+        self._on_screen_changed(self, self.get_screen())
+        self.override_background_color(
+            Gtk.StateFlags.NORMAL, Gdk.RGBA(0.0, 0.0, 0.0, 0.0))
         self.connect("draw", self._on_draw)
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
@@ -147,6 +149,11 @@ class OSD(Gtk.Window):
         self.show_all()
         GLib.timeout_add(OSD_DURATION_MS, Gtk.main_quit)
 
+    def _on_screen_changed(self, _, screen):
+        visual = screen.get_rgba_visual() if screen else None
+        if visual:
+            self.set_visual(visual)
+
     def _on_draw(self, _, cr):
         # Keep the window fully transparent outside the rounded OSD box.
         cr.set_source_rgba(0, 0, 0, 0)
@@ -158,7 +165,7 @@ class OSD(Gtk.Window):
     def _apply_style(self):
         css = Gtk.CssProvider()
         css.load_from_data(f"""
-            #osd-win, window, .background {{
+            #osd-win, window, window.background, .background {{
                 background-color: transparent;
                 box-shadow: none;
             }}
