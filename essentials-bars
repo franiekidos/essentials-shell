@@ -628,14 +628,14 @@ def _build_trilands():
             GtkLayerShell.set_layer(self, GtkLayerShell.Layer.TOP)
             GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
             GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, 8)
+            # Keep all trilands windows on the same vertical geometry track.
+            GtkLayerShell.set_exclusive_zone(self, -1)
             if pos == "left":
-                GtkLayerShell.set_exclusive_zone(self, 46)
                 GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
                 GtkLayerShell.set_margin(self, GtkLayerShell.Edge.LEFT, 12)
             elif pos == "center":
-                GtkLayerShell.set_exclusive_zone(self, -1)
+                pass
             elif pos == "right":
-                GtkLayerShell.set_exclusive_zone(self, -1)
                 GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
                 GtkLayerShell.set_margin(self, GtkLayerShell.Edge.RIGHT, 12)
             box = Gtk.Box(spacing=8)
