@@ -63,6 +63,7 @@ BINS=(
     essentials-osd essentials-wallpaper essentials-lockscreen
     essentials-widgets essentials-wizard
     essentials-dock essentials-idle essentials-clipboard essentials-weather
+    essentials-plugin
 )
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -291,7 +292,9 @@ fi
 # ── Install binaries ──────────────────────────────────────────────
 section "Installing binaries → $DEST_BIN"
 mkdir -p "$DEST_BIN" "$DEST_CFG" "$CACHE_DIR/wallhaven" \
-          "$DEST_CFG/wallpapers"
+          "$DEST_CFG/wallpapers" \
+          "$DEST_CFG/plugins/shell" \
+          "$DEST_CFG/plugins/wm"
 
 for b in "${BINS[@]}"; do
     [[ -f "$b" ]] || { warn "$b not found in current directory — skipping"; continue; }

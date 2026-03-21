@@ -27,6 +27,7 @@
 - 🖱️ **Input settings** written to compositor config, applied live via IPC
 - 🪄 **Setup wizard** for first-time configuration
 - 🔌 **Plugin manager** for Hyprland (via `hyprpm`)
+- 🧩 **Shell + WM plugin hooks** (`pre-start`, `post-start`, `pre-stop`, `post-stop`, `status`)
 
 ---
 
@@ -281,12 +282,36 @@ essentials-detect --json   # prints: {"name":"hyprland","config":"...","plugins"
 | `~/.config/essentials/config.json` | Bar layout, style, widgets, wallpaper, locker |
 | `~/.config/essentials/themes.json` | Theme definitions |
 | `~/.config/essentials/wallpapers/` | Downloaded wallpapers |
+| `~/.config/essentials/plugins/shell/` | Shell-level plugin executables |
+| `~/.config/essentials/plugins/wm/<wm>/` | WM-specific plugin executables |
 | `~/.cache/essentials/wallhaven/` | Wallhaven thumbnail cache |
 | `~/.config/essentials/.wizard_done` | Wizard completion flag |
 
 ---
 
 ## 🤝 Contributing
+
+## 🧩 Plugin Hooks
+
+`launch.sh` automatically runs plugin hooks via `essentials-plugin`.
+
+- Shell plugins: `~/.config/essentials/plugins/shell/*`
+- WM plugins: `~/.config/essentials/plugins/wm/<wm>/*` (example: `hyprland`, `sway`)
+- Plugins must be executable files.
+
+Environment variables passed to plugins:
+
+- `ESSENTIALS_EVENT` → one of `pre-start`, `post-start`, `pre-stop`, `post-stop`, `status`
+- `ESSENTIALS_WM` → detected WM/compositor name
+
+Example plugin:
+
+```bash
+#!/usr/bin/env bash
+case "$ESSENTIALS_EVENT" in
+  post-start) notify-send "Essentials" "Started on $ESSENTIALS_WM" ;;
+esac
+```
 
 Contributions welcome. Please open an issue before a large PR to discuss the approach.
 

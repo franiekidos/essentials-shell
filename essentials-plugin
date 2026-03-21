@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+essentials-plugin - plugin hook runner for Essentials Shell.
+
+Usage:
+  essentials-plugin <event> [wm]
+
+Examples:
+  essentials-plugin pre-start
+  essentials-plugin post-start hyprland
+  essentials-plugin stop sway
+"""
+import os
+import sys
+import stat
+import subprocess
+
+CFG_ROOT = os.path.expanduser("~/.config/essentials/plugins")
+SHELL_DIR = os.path.join(CFG_ROOT, "shell")
+WM_DIR = os.path.join(CFG_ROOT, "wm")
+
+
+def _detect_wm():
+    env = {k.lower(): v for k, v in os.environ.items()}
+    if "hyprland_instance_signature" in env:
+        return "hyprland"
+    if "niri_socket" in env:
+        return "niri"
+    if "swaysock" in env:
+        return "sway"
+    return env.get("xdg_current_desktop", "generic").lower()
+
+
+def _is_executable_file(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and os.access(path, os.X_OK)
+
+
+def _iter_plugins(directory):
+    if not os.path.isdir(directory):
+        return []
+    plugins = []
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if _is_executable_file(path):
+            plugins.append(path)
+    return plugins
+
+
+def _run_plugin(path, event, wm):
+    env = os.environ.copy()
+    env["ESSENTIALS_EVENT"] = event
+    env["ESSENTIALS_WM"] = wm
+    try:
+        return subprocess.run([path], env=env, stderr=subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+
+
+def run_plugins(event, wm):
+    shell_plugins = _iter_plugins(SHELL_DIR)
+    wm_plugins = _iter_plugins(os.path.join(WM_DIR, wm))
+    ok = 0
+    fail = 0
+    for plugin in shell_plugins + wm_plugins:
+        if _run_plugin(plugin, event, wm):
+            ok += 1
+        else:
+            fail += 1
+    return ok, fail
+
+
+def ensure_dirs():
+    for path in (SHELL_DIR, WM_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+    event = sys.argv[1].strip().lower()
+    wm = sys.argv[2].strip().lower() if len(sys.argv) > 2 else _detect_wm()
+    ensure_dirs()
+    ok, fail = run_plugins(event, wm)
+    print(f"event={event} wm={wm} ran={ok + fail} ok={ok} fail={fail}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

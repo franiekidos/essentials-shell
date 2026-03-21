@@ -29,6 +29,7 @@ BIN="$HOME/.local/bin"
 CFG="$HOME/.config/essentials"
 DONE_FLAG="$CFG/.wizard_done"
 PY="python3"
+PLUGIN_RUNNER="$BIN/essentials-plugin"
 
 # Components and their process match strings
 declare -A PROCS=(
@@ -90,6 +91,21 @@ launch() {
     fi
 }
 
+detect_wm() {
+    [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && echo "hyprland" && return
+    [[ -n "${NIRI_SOCKET:-}" ]]                 && echo "niri" && return
+    [[ -n "${SWAYSOCK:-}" ]]                    && echo "sway" && return
+    echo "${XDG_CURRENT_DESKTOP:-generic}" | tr '[:upper:]' '[:lower:]'
+}
+
+run_plugins() {
+    local event="$1" wm="$2"
+    if [[ -x "$PLUGIN_RUNNER" ]]; then
+        "$PY" "$PLUGIN_RUNNER" "$event" "$wm" >/tmp/essentials-plugins.log 2>&1 || true
+        dim "Plugins: $event ($wm)"
+    fi
+}
+
 # ── Read config ───────────────────────────────────────────────────
 widgets_enabled() {
     $NO_WIDGETS && return 1
@@ -109,6 +125,8 @@ case "$CMD" in
 # ── start ─────────────────────────────────────────────────────────
 start)
     echo -e "\n${BLD}${C}Essentials Shell${RST}\n"
+    WM="$(detect_wm)"
+    run_plugins "pre-start" "$WM"
 
     # First-run wizard
     if [[ ! -f "$DONE_FLAG" ]] && ! $NO_WIZARD; then
@@ -174,6 +192,7 @@ except: pass
     if python3 -c "import json,os; d=json.load(open(os.path.expanduser('$CFG/config.json'))); exit(0 if d.get('idle',{}).get('lock_after',0)>0 else 1)" 2>/dev/null; then
         launch essentials-idle
     fi
+    run_plugins "post-start" "$WM"
 
     info "Shell running. Open the CC from the bar, or:"
     dim "  Settings:  $PY $BIN/essentials-settings"
@@ -184,6 +203,8 @@ except: pass
 # ── stop ──────────────────────────────────────────────────────────
 stop)
     echo -e "\n${BLD}${C}Stopping Essentials Shell${RST}\n"
+    WM="$(detect_wm)"
+    run_plugins "pre-stop" "$WM"
     STOPPED=0
     for name in essentials-bars essentials-widgets essentials-cc \
                 essentials-launcher essentials-powermenu essentials-wallpaper \
@@ -196,6 +217,7 @@ stop)
         fi
     done
     [[ "$STOPPED" -eq 0 ]] && dim "Nothing was running" || info "$STOPPED component(s) stopped"
+    run_plugins "post-stop" "$WM"
     echo ""
     ;;
 
@@ -215,6 +237,7 @@ restart)
 # ── status ────────────────────────────────────────────────────────
 status)
     echo -e "\n${BLD}${C}Essentials Shell Status${RST}\n"
+    WM="$(detect_wm)"
 
     declare -A ALL=(
         [essentials-bars]="Bar"
@@ -267,6 +290,7 @@ PYEOF
     [[ "$RUNNING" -eq 0 ]] \
         && info "Shell is not running — start with: $0 start" \
         || info "$RUNNING component(s) running"
+    run_plugins "status" "$WM"
     echo ""
     ;;
 
